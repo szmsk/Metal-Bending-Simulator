@@ -214,13 +214,3 @@ Rozpoznano etykiety i porównano z katalogiem producenta Rolleri:
 **Przykład regresyjny:** C 50×80×50 mm, G2, wartości przykładowe t=2 mm, V16. Wąski stempel PS.135.85.R08: przy ok. 6 mm prześwitu ostrzeżenie bez zatrzymania; szerszy TOP.175.60.R5: zatrzymanie w okolicach 77,5% skoku, przy prześwicie ok. 0,01 mm obliczonym dla *uproszczonych przekrojów*. Nie jest to odwzorowanie rzeczywistej kolizji na Ermaksanie bez dokładnych modeli narzędzi.
 
 **Ograniczenia:** model brył wyciągniętych z 2D wzdłuż osi Z, schematyczne kontury narzędzi/mocowań, dyskretne próbkowanie. Brak wykrytego kontaktu nie potwierdza bezpieczeństwa ani fizycznej możliwości gięcia.
-
-## Uruchamianie na Windows z repozytorium GitHub
-
-1. Pobierz repozytorium (Code -> Download ZIP) i rozpakuj.
-2. Kliknij dwukrotnie `Uruchom_FalconBEND.bat`. Skrypt rozpakowuje `FalconBEND.exe` z `FalconBEND_Launcher_Binary.zip` tylko przy pierwszym starcie.
-3. Aplikacja otworzy się w lokalnej przeglądarce. Działającą usługę zamkniesz plikiem `Zamknij_FalconBEND.vbs`.
-
-Przy pierwszym uruchomieniu nadal potrzebne są Node.js i internet do instalacji zależności. Później program działa lokalnie, bez `npm run dev`. Plik `FalconBEND.exe` jest celowo pakowany do archiwum, aby ograniczyć rozmiar repozytorium.
-
-**Uwaga techniczna:** wyniki kolizji opierają się na przybliżonych bryłach narzędzi i korpusu. Brak wykrytej kolizji nie jest potwierdzeniem bezpiecznego gięcia na rzeczywistej prasie.
