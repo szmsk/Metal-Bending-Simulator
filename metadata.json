@@ -1,0 +1,6 @@
+{
+  "name": "SigmaBEND",
+  "description": "Zaawansowany system CAD/CAM do symulacji gięcia blach na prasach krawędziowych z obliczeniami sprężynowania, optymalizacją sekwencji oraz detekcją kolizji 3D.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
