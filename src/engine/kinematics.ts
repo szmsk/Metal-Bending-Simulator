@@ -90,7 +90,7 @@ export function getStepOrientation(
 }
 
 /**
- * Evaluates the exact 2D cross-section geometry of the sheet metal, punch Y,
+ * Evaluates an approximate 2D cross-section geometry of the sheet metal, punch Y,
  * and CNC backgauge position for a given step and stroke progress u in [0, 1].
  */
 export function evaluateKinematics(
@@ -202,7 +202,7 @@ export function evaluateKinematics(
     const rawTarget = part.bends[origBendIdx].targetAngleDeg;
     const rawMag = compensateSpringback
       ? Math.abs(rawTarget)
-      : Math.max(0, Math.abs(rawTarget) - springback.springbackDeg * 0.85);
+      : Math.max(0, Math.abs(rawTarget) - perBendSpringback[origBendIdx].springbackDeg);
     const rawSign = rawTarget >= 0 ? 1 : -1;
     // Flipping upside down inverts all bend signs relative to press +Y.
     // Flipping horizontally (180° around Y) preserves +Y vs -Y bend sign!
@@ -214,13 +214,33 @@ export function evaluateKinematics(
   const numBends = Math.max(0, numSegs - 1);
   const setbacks: number[] = new Array(numBends).fill(0);
   const effRCenters: number[] = new Array(numBends).fill(0);
+  // A completed bend keeps its own geometric radius and springback; it must not
+  // inherit the currently selected bend's radius/material response.
+  const perBendSpringback = part.bends.map((bend, origIndex) =>
+    origIndex === activeBendIndex
+      ? springback
+      : calculateSpringback(
+          origIndex,
+          bend.targetAngleDeg,
+          Math.min(part.segmentLengthsMm[origIndex], part.segmentLengthsMm[origIndex + 1]),
+          part,
+          material,
+          punch,
+          die,
+          customKFactor
+        )
+  );
+  const centerRadiusAt = (orientedIndex: number) => {
+    const orig = flipHorizontal ? numBends - 1 - orientedIndex : orientedIndex;
+    return perBendSpringback[orig].effectiveRadiusMm + t * 0.5;
+  };
   const rCenterIdeal = springback.effectiveRadiusMm + t * 0.5;
 
   for (let b = 0; b < numBends; b++) {
     const angleDeg = getOrientedBendAngleDeg(b);
     const absTurn = Math.abs(angleDeg) * DEG_TO_RAD;
     if (absTurn >= 0.008) {
-      setbacks[b] = rCenterIdeal * Math.tan(absTurn * 0.5);
+      setbacks[b] = centerRadiusAt(b) * Math.tan(absTurn * 0.5);
     }
   }
 

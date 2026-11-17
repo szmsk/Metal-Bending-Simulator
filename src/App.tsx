@@ -1,8 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Pause, Play } from 'lucide-react';
-import { DIE_TOOLS, MATERIALS, PART_PRESETS, PUNCH_TOOLS } from './data/library';
+import { DEFAULT_MACHINE, DIE_TOOLS, MATERIALS, PART_PRESETS, PUNCH_TOOLS } from './data/library';
 import { simulateFullSequenceCollisions } from './engine/collisionEngine';
-import { BendStepConfig, PartDefinition, WorkspaceTab } from './types/bending';
+import { BendStepConfig, DieTool, PartDefinition, PressMachineSpec, PunchTool, WorkspaceTab } from './types/bending';
 import { PressBrakeViewport } from './components/PressBrakeViewport';
 import { LeftSequencePanel } from './components/LeftSequencePanel';
 import { RightInspectorPanel } from './components/RightInspectorPanel';
@@ -14,11 +14,39 @@ function createDefaultSteps(part: PartDefinition): BendStepConfig[] {
   }));
 }
 
+function loadCustomTool<T>(key: string): T | undefined {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ? JSON.parse(value) as T : undefined;
+  } catch { return undefined; }
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('simulation');
+  const [customPunch, setCustomPunch] = useState<PunchTool | undefined>(() => loadCustomTool<PunchTool>('falcon-custom-punch'));
+  const [customDie, setCustomDie] = useState<DieTool | undefined>(() => loadCustomTool<DieTool>('falcon-custom-die'));
+  const punchList = useMemo(() => customPunch ? [...PUNCH_TOOLS, customPunch] : PUNCH_TOOLS, [customPunch]);
+  const dieList = useMemo(() => customDie ? [...DIE_TOOLS, customDie] : DIE_TOOLS, [customDie]);
+  const [machine, setMachine] = useState<PressMachineSpec>(() =>
+    loadCustomTool<PressMachineSpec>('falcon-machine') ?? DEFAULT_MACHINE
+  );
+  const handleUpdateMachine = (next: PressMachineSpec) => {
+    setMachine(next);
+    try { window.localStorage.setItem('falcon-machine', JSON.stringify(next)); } catch { /* private mode */ }
+  };
+  const handleSavePunch = (tool: PunchTool) => {
+    setCustomPunch(tool);
+    try { window.localStorage.setItem('falcon-custom-punch', JSON.stringify(tool)); } catch { /* private browser mode */ }
+    setPunchId(tool.id);
+  };
+  const handleSaveDie = (tool: DieTool) => {
+    setCustomDie(tool);
+    try { window.localStorage.setItem('falcon-custom-die', JSON.stringify(tool)); } catch { /* private browser mode */ }
+    setDieId(tool.id);
+  };
   const [part, setPart] = useState<PartDefinition>(PART_PRESETS[0]);
-  const [punchId, setPunchId] = useState<string>(PUNCH_TOOLS[0].id);
-  const [dieId, setDieId] = useState<string>(DIE_TOOLS[2].id); // V35 (Rolleri M.460.R) dla blachy 4 mm
+  const [punchId, setPunchId] = useState<string>(() => customPunch?.id ?? PUNCH_TOOLS[0].id);
+  const [dieId, setDieId] = useState<string>(() => customDie?.id ?? DIE_TOOLS[2].id); // V35 (Rolleri M.460.R) dla blachy 4 mm
   const [punchReversed, setPunchReversed] = useState<boolean>(false);
   const [compensateSpringback, setCompensateSpringback] = useState<boolean>(true);
   const [customKFactor, setCustomKFactor] = useState<number | undefined>(undefined);
@@ -37,12 +65,12 @@ export default function App() {
     [part.materialId]
   );
   const punch = useMemo(
-    () => PUNCH_TOOLS.find((p) => p.id === punchId) ?? PUNCH_TOOLS[0],
-    [punchId]
+    () => punchList.find((p) => p.id === punchId) ?? PUNCH_TOOLS[0],
+    [punchId, punchList]
   );
   const die = useMemo(
-    () => DIE_TOOLS.find((d) => d.id === dieId) ?? DIE_TOOLS[2],
-    [dieId]
+    () => dieList.find((d) => d.id === dieId) ?? DIE_TOOLS[2],
+    [dieId, dieList]
   );
 
   // Full swept-stroke collision, springback & machine limit simulation for the user-defined sequence
@@ -57,9 +85,10 @@ export default function App() {
         compensateSpringback,
         punchReversed,
         customKFactor,
-        20
+        20,
+        machine
       ),
-    [part, material, punch, die, steps, compensateSpringback, punchReversed, customKFactor]
+    [part, material, punch, die, steps, compensateSpringback, punchReversed, customKFactor, machine]
   );
 
   const handleSelectPreset = (presetId: string) => {
@@ -244,6 +273,7 @@ export default function App() {
             material={material}
             punch={punch}
             die={die}
+            machine={machine}
             steps={steps}
             currentStepIdx={currentStepIdx}
             strokeProgress={strokeProgress}
@@ -267,6 +297,8 @@ export default function App() {
             material={material}
             punch={punch}
             die={die}
+            machine={machine}
+            onUpdateMachine={handleUpdateMachine}
             punchReversed={punchReversed}
             compensateSpringback={compensateSpringback}
             customKFactor={customKFactor}
@@ -274,6 +306,10 @@ export default function App() {
             steps={steps}
             stepReports={stepReports}
             currentStepIdx={currentStepIdx}
+            punchList={punchList}
+            dieList={dieList}
+            onSavePunch={handleSavePunch}
+            onSaveDie={handleSaveDie}
             onSelectPunch={setPunchId}
             onSelectDie={setDieId}
             onTogglePunchReversed={() => setPunchReversed((v) => !v)}

@@ -39,6 +39,8 @@ export interface PunchTool {
   /** 2D cross-section polygon in mm relative to punch tip (0,0), extending into +Y */
   profile2D: Point2D[];
   description: string;
+  /** Editor supplied profile; NOT independently validated against a physical tool */
+  profileOrigin?: 'user';
 }
 
 export interface DieTool {
@@ -54,6 +56,7 @@ export interface DieTool {
   minFlangeMm: number;
   /** 2D cross-section polygon in mm relative to top shoulder plane (y=0) */
   profile2D: Point2D[];
+  profileOrigin?: 'user';
 }
 
 export interface BendDefinition {
@@ -115,7 +118,34 @@ export interface SpringbackAnalysis {
   flangeTooShort: boolean;
 }
 
+export interface MachineCollisionGeometry {
+  /** Approximate side-section envelope of the clamping bar at the punch shank. */
+  clampHalfWidthMm: number;
+  ramHalfWidthMm: number;
+  ramBodyHeightMm: number;
+  dieHolderHalfWidthMm: number;
+  dieHolderHeightMm: number;
+  bedHalfWidthMm: number;
+  backgaugeFingerDepthMm: number;
+  backgaugeFingerHeightMm: number;
+  /** In mm, installed tooling length; default derives from part width. */
+  toolLengthMm?: number;
+  /** Center Z offset for the tool assembly. */
+  toolOffsetZMm?: number;
+  /** Placement of sheet center along bending axis Z (mm). */
+  partOffsetZMm?: number;
+  backgaugeFingerWidthMm?: number;
+  backgaugeFingerSeparationMm?: number;
+  /** Diagnostic margin for obstacles outside the intended forming zone. NOT a safety standard. */
+  minimumFreeClearanceMm?: number;
+  /** Optional actual tool segment intervals measured from press center, in mm. */
+  punchStationsZMm?: { startMm: number; endMm: number }[];
+  dieStationsZMm?: { startMm: number; endMm: number }[];
+}
+
 export interface PressMachineSpec {
+  collisionGeometry: MachineCollisionGeometry;
+
   id: string;
   manufacturer: string;
   model: string;
@@ -156,9 +186,15 @@ export interface CollisionEvent {
   penetrationMm: number;
   /** Minimum clearance in mm (negative means penetration) */
   clearanceMm: number;
-  /** Exact 2D contact point in press brake frame (mm) */
+  /** Approximate 2D contact point in press brake frame (mm) */
   contactPointMm: Point2D;
+  /** 3D contact point with Z across the bending length. */
+  contactPoint3Dmm?: { x: number; y: number; z: number };
+  /** Width of intersecting Z spans, useful for identifying segment-specific hits. */
+  overlapWidthMm?: number;
   message: string;
+  /** Kept for compatibility with older files. Warnings NEVER pause playback. */
+  requiresHold?: boolean;
 }
 
 export interface StepSimulationReport {
@@ -176,6 +212,12 @@ export interface StepSimulationReport {
   backgaugeRMm: number;
   tonnageExceeded: boolean;
   backgaugeOutOfRange: boolean;
+  toolLoadExceeded: boolean;
+  bendingLengthExceeded: boolean;
+  checkedFrames: number;
+  samplingConverged: boolean;
+  /** False when either tool leaves a section of the sheet width without a matching segment. */
+  toolingCoversSheetWidth: boolean;
 }
 
 export interface SequenceCandidate {

@@ -5,24 +5,32 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   AlertTriangle,
-  CheckCircle2,
+  CornerUpLeft,
+  Camera,
+  SlidersHorizontal,
   ChevronLeft,
   ChevronRight,
   Pause,
   Play,
   RotateCcw,
 } from 'lucide-react';
-import { DEFAULT_MACHINE } from '../data/library';
+
 import {
   BendStepConfig,
   CollisionEvent,
   DieTool,
   PartDefinition,
+  PressMachineSpec,
   PunchTool,
   SheetMaterial,
 } from '../types/bending';
 import { evaluateKinematics, KinematicFrame } from '../engine/kinematics';
-import { detectFrameCollisions } from '../engine/collisionEngine';
+import { getBendMarks } from '../engine/bendMarks';
+import { absoluteMainCamera, isMainCameraView, MAIN_CAMERA_STORAGE_KEY, MainCameraView, REFERENCE_MAIN_CAMERA, relativeMainCamera } from '../engine/mainCameraView';
+import { detectFrameCollisions, findFirstBlockingFrame } from '../engine/collisionEngine';
+import { createFrameLoop } from '../engine/frameLoop';
+import { cFrameSectionMm, FRAME_ACCENT_Y_SEGMENTS_MM, FRAME_FRONT_FACE_X_MM, getMachineZLayout } from '../engine/machineLayout';
+import { CAMERA_SENSITIVITY_KEY, DEFAULT_CAMERA_SENSITIVITY, cameraControlSpeeds, clampCameraSensitivity } from '../engine/cameraControls';
 
 import { turnToIncludedAngleDeg } from '../engine/bendingMath';
 
@@ -37,6 +45,7 @@ interface PressBrakeViewportProps {
   material: SheetMaterial;
   punch: PunchTool;
   die: DieTool;
+  machine: PressMachineSpec;
   steps: BendStepConfig[];
   currentStepIdx: number;
   strokeProgress: number;
@@ -52,10 +61,18 @@ interface PressBrakeViewportProps {
   onResetSim: () => void;
 }
 
-const INITIAL_CAMERA = {
-  pos: [34, 18, 44] as [number, number, number],
-  target: [0, 3.5, 0] as [number, number, number],
-};
+// The old [34, 18, 44] isometric "home" was too distant and at the wrong
+// angle for the near-frontal bending close-up shown in the reference image.
+function readMainCameraView(): MainCameraView {
+  try {
+    const raw = window.localStorage.getItem(MAIN_CAMERA_STORAGE_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (isMainCameraView(parsed)) return parsed;
+    }
+  } catch { /* private browsing or invalid saved data */ }
+  return REFERENCE_MAIN_CAMERA;
+}
 
 function createRulerTexture(maxAniso: number): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
@@ -105,10 +122,9 @@ function makeExtrudedProfileGeometry(points: { x: number; y: number }[], lengthZ
 
   const geo = new THREE.ExtrudeGeometry(shape, {
     depth: lengthZ,
-    bevelEnabled: true,
-    bevelThickness: 0.08,
-    bevelSize: 0.06,
-    bevelSegments: 2,
+    // Do not round the collision outlines in display: visible tool geometry must match
+    // the exact prismatic solids tested by collision3d.ts.
+    bevelEnabled: false,
   });
   geo.translate(0, 0, -lengthZ * 0.5);
   geo.computeVertexNormals();
@@ -138,6 +154,7 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
   material,
   punch,
   die,
+  machine,
   steps,
   currentStepIdx,
   strokeProgress,
@@ -154,7 +171,17 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const [dockCollapsed, setDockCollapsed] = useState(false);
+  const [cameraPanelOpen, setCameraPanelOpen] = useState(false);
+  const [cameraSensitivity, setCameraSensitivity] = useState(() => {
+    try { return clampCameraSensitivity(Number(window.localStorage.getItem(CAMERA_SENSITIVITY_KEY) ?? DEFAULT_CAMERA_SENSITIVITY)); }
+    catch { return DEFAULT_CAMERA_SENSITIVITY; }
+  });
   const [contextLost, setContextLost] = useState(false);
+  const [collisionPaused, setCollisionPaused] = useState(false);
+  const [viewSaved, setViewSaved] = useState(() => {
+    try { return isMainCameraView(JSON.parse(window.localStorage.getItem(MAIN_CAMERA_STORAGE_KEY) ?? 'null')); }
+    catch { return false; }
+  });
 
   // Live kinematic & collision readout for HUD
   const currentFrame: KinematicFrame = evaluateKinematics(
@@ -173,14 +200,15 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     part,
     punch,
     die,
-    punchReversed
+    punchReversed,
+    machine
   );
   const criticalEvents = liveCollisions.filter((c) => c.severity === 'critical');
   const warningEvents = liveCollisions.filter((c) => c.severity === 'warning');
-  const tonnageExceeded = currentFrame.springback.bendingForceKn > DEFAULT_MACHINE.maxForceKn;
+  const tonnageExceeded = currentFrame.springback.bendingForceKn > machine.maxForceKn;
   const backgaugeOutOfRange =
     currentFrame.strokeProgress <= 0.18 &&
-    Math.abs(currentFrame.backgaugeXMm) > DEFAULT_MACHINE.backgaugeXMaxMm;
+    Math.abs(currentFrame.backgaugeXMm) > machine.backgaugeXMaxMm;
 
   // Mutable refs for Three.js loop access without tearing down canvas
   const stateRef = useRef({
@@ -188,6 +216,7 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     material,
     punch,
     die,
+    machine,
     steps,
     currentStepIdx,
     strokeProgress,
@@ -207,6 +236,7 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     material,
     punch,
     die,
+    machine,
     steps,
     currentStepIdx,
     strokeProgress,
@@ -225,6 +255,9 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     requestRender: () => void;
     rebuildTooling: () => void;
     updateDynamicFrame: () => void;
+    restoreMainView: () => void;
+    saveMainView: () => void;
+    setCameraSensitivity: (value: number) => void;
   } | null>(null);
 
   // Initialize Three.js WebGL scene once
@@ -279,16 +312,35 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
       0.2,
       1600
     );
-    camera.position.set(...INITIAL_CAMERA.pos);
+    // Set the default camera relative to the +Z face of the current sheet.
+    // Otherwise a wide sheet can be closer to the viewer than the camera.
+    let returnCameraView = readMainCameraView();
+    const startingView = absoluteMainCamera(returnCameraView, stateRef.current.part.widthMm);
+    camera.position.set(...startingView.pos);
 
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = !isSoftwareGl;
-    controls.dampingFactor = 0.06;
-    controls.minDistance = 8;
+    // CAD navigation: deliberately slow, screen-aligned pan and short inertia.
+    // Zoom follows the target, never jumps toward an arbitrary mesh under cursor.
+    controls.enableDamping = true;
+    controls.screenSpacePanning = true;
+    controls.zoomToCursor = false;
+    controls.enableRotate = true;
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    const setCameraSensitivity = (value: number) => {
+      const speeds = cameraControlSpeeds(value);
+      controls.rotateSpeed = speeds.rotateSpeed;
+      controls.panSpeed = speeds.panSpeed;
+      controls.zoomSpeed = speeds.zoomSpeed;
+      controls.dampingFactor = speeds.dampingFactor;
+    };
+    setCameraSensitivity(cameraSensitivity);
+    controls.minDistance = 7;
     controls.maxDistance = 620;
-    controls.maxPolarAngle = Math.PI * 0.62;
-    controls.target.set(...INITIAL_CAMERA.target);
+    controls.maxPolarAngle = Math.PI * 0.85;
+    controls.target.set(...startingView.target);
     controls.update();
+    controls.saveState();
 
     // 3-Point Studio Lighting Rig
     const hemiLight = new THREE.HemisphereLight(0xcbd5e1, 0x1e293b, 0.65);
@@ -354,73 +406,72 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
       metalness: 0.65,
     });
 
-    const beamLen = DEFAULT_MACHINE.bendingLengthMm * SCALE; // 410 units (4100 mm)
-    const halfCols = (DEFAULT_MACHINE.distanceBetweenColumnsMm * 0.5) * SCALE; // 180 units (3600 mm gap)
-    const throatX = -DEFAULT_MACHINE.throatDepthMm * SCALE; // -41 units (410 mm throat)
+    const beamLen = machine.bendingLengthMm * SCALE;
+    const halfCols = (machine.distanceBetweenColumnsMm * 0.5) * SCALE;
+    const throatX = -machine.throatDepthMm * SCALE;
+    const layout = getMachineZLayout(machine.bendingLengthMm, machine.distanceBetweenColumnsMm);
 
-    // Lower Press Bed (Stół Dolny 4100 mm)
-    const lowerBed = new THREE.Mesh(new THREE.BoxGeometry(12, 30, beamLen + 4), frameDarkMat);
-    lowerBed.position.set(0, -23.5, 0);
-    lowerBed.receiveShadow = true;
-    lowerBed.castShadow = true;
-    machineGroup.add(lowerBed);
+    // Both long rails are built as independent, non-overlapping sections.
+    // A 2 mm assembly clearance at the housings prevents coincident depth faces
+    // and the visible flickering/streaks that appeared at the ends of the machine.
+    const makeRails = (material: THREE.Material, initialHeight: number) => layout.structuralRails.map(span => {
+      const len = (span.endMm - span.startMm) * SCALE;
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(12, initialHeight, len), material);
+      mesh.position.z = (span.startMm + span.endMm) * SCALE / 2;
+      mesh.receiveShadow = true;
+      mesh.castShadow = true;
+      machineGroup.add(mesh);
+      return mesh;
+    });
+    const lowerBeds = makeRails(frameDarkMat, 30);
+    const dieHolders = makeRails(steelTrimMat, 2.5);
 
-    // Lower CNC Crowning & Die Holder Rail (90 mm table width)
-    const dieHolder = new THREE.Mesh(
-      new THREE.BoxGeometry(DEFAULT_MACHINE.tableWidthMm * SCALE, 2.5, beamLen),
-      steelTrimMat
-    );
-    dieHolder.position.set(0, -7.25, 0);
-    dieHolder.receiveShadow = true;
-    machineGroup.add(dieHolder);
-
-    // C-Frame Side Housings (Ermaksan 410 mm throat depth, 3600 mm between columns)
+    // The C profile uses the same outline as the prism collision model.
+    // Bevel-free sides avoid coplanar/overlapping bevel faces at the joints.
     const cFrameShape = new THREE.Shape();
-    cFrameShape.moveTo(throatX - 32, -45);
-    cFrameShape.lineTo(10, -45);
-    cFrameShape.lineTo(10, -8);
-    cFrameShape.lineTo(throatX + 4, -8);
-    cFrameShape.lineTo(throatX, -4);
-    cFrameShape.lineTo(throatX, 26);
-    cFrameShape.lineTo(throatX + 6, 30);
-    cFrameShape.lineTo(10, 30);
-    cFrameShape.lineTo(10, 56);
-    cFrameShape.lineTo(throatX - 32, 56);
+    const frameSection = cFrameSectionMm(machine.throatDepthMm);
+    cFrameShape.moveTo(frameSection[0].x * SCALE, frameSection[0].y * SCALE);
+    for (const point of frameSection.slice(1)) cFrameShape.lineTo(point.x * SCALE, point.y * SCALE);
     cFrameShape.closePath();
-
     const cFrameGeo = new THREE.ExtrudeGeometry(cFrameShape, {
       depth: 8,
-      bevelEnabled: true,
-      bevelThickness: 0.25,
-      bevelSize: 0.2,
-      bevelSegments: 2,
+      bevelEnabled: false,
     });
     cFrameGeo.translate(0, 0, -4);
 
-    const leftFrame = new THREE.Mesh(cFrameGeo, frameDarkMat);
-    leftFrame.position.set(0, 0, -halfCols - 4);
-    leftFrame.castShadow = true;
-    leftFrame.receiveShadow = true;
-    machineGroup.add(leftFrame);
+    for (const span of layout.columns) {
+      const centerZ = (span.startMm + span.endMm) * SCALE / 2;
+      const shell = new THREE.Mesh(cFrameGeo, frameDarkMat);
+      shell.position.z = centerZ;
+      shell.castShadow = true;
+      shell.receiveShadow = true;
+      machineGroup.add(shell);
 
-    const rightFrame = new THREE.Mesh(cFrameGeo, frameDarkMat);
-    rightFrame.position.set(0, 0, halfCols + 4);
-    rightFrame.castShadow = true;
-    rightFrame.receiveShadow = true;
-    machineGroup.add(rightFrame);
+      // Accent panels belong only on the UPPER and LOWER arms of the C housing.
+      // The throat opening between these arms must remain completely free.
+      // Offset > 0 from the housing face avoids z-fighting with the shell.
+      for (const seg of FRAME_ACCENT_Y_SEGMENTS_MM) {
+        const height = (seg.endMm - seg.startMm) * SCALE;
+        const panel = new THREE.Mesh(
+          new THREE.BoxGeometry(0.20, height, 7.4), ermaksanAccentMat
+        );
+        panel.position.set(
+          (FRAME_FRONT_FACE_X_MM + 2.5) * SCALE,
+          (seg.startMm + seg.endMm) * SCALE / 2,
+          centerZ
+        );
+        machineGroup.add(panel);
+      }
+    }
 
-    // Ermaksan Signature Side Trim Panels
-    const sideAccentGeo = new THREE.BoxGeometry(1.2, 76, 8.4);
-    const leftAccent = new THREE.Mesh(sideAccentGeo, ermaksanAccentMat);
-    leftAccent.position.set(9.6, 5, -halfCols - 4);
-    machineGroup.add(leftAccent);
-    const rightAccent = new THREE.Mesh(sideAccentGeo, ermaksanAccentMat);
-    rightAccent.position.set(9.6, 5, halfCols + 4);
-    machineGroup.add(rightAccent);
-
-    // Upper Crossbeam Support (4100 mm span)
-    const topHeader = new THREE.Mesh(new THREE.BoxGeometry(22, 10, beamLen + 18), frameDarkMat);
-    topHeader.position.set(throatX - 8, 51, 0);
+    // The top support stops just before the side housings, not inside them.
+    const headerSpan = layout.topHeader;
+    const topHeader = new THREE.Mesh(
+      new THREE.BoxGeometry(22, 10, (headerSpan.endMm - headerSpan.startMm) * SCALE),
+      frameDarkMat
+    );
+    topHeader.position.set(throatX - 8, 51, (headerSpan.startMm + headerSpan.endMm) * SCALE / 2);
+    topHeader.castShadow = true;
     machineGroup.add(topHeader);
 
     // Instanced Clamping Bolts along 4100mm lower die rail
@@ -429,12 +480,16 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     const boltCount = 42;
     const boltInst = new THREE.InstancedMesh(boltGeo, accentAmberMat, boltCount);
     const dummy = new THREE.Object3D();
+    let visibleBolts = 0;
     for (let i = 0; i < boltCount; i++) {
       const z = -beamLen * 0.48 + (i / (boltCount - 1)) * (beamLen * 0.96);
-      dummy.position.set(DEFAULT_MACHINE.tableWidthMm * SCALE * 0.5 + 0.1, -7.2, z);
+      const mm = z / SCALE;
+      if (!layout.structuralRails.some(span => mm >= span.startMm && mm <= span.endMm)) continue;
+      dummy.position.set(machine.tableWidthMm * SCALE * 0.5 + 0.1, -7.2, z);
       dummy.updateMatrix();
-      boltInst.setMatrixAt(i, dummy.matrix);
+      boltInst.setMatrixAt(visibleBolts++, dummy.matrix);
     }
+    boltInst.count = visibleBolts;
     boltInst.instanceMatrix.needsUpdate = true;
     boltInst.computeBoundingSphere();
     machineGroup.add(boltInst);
@@ -528,45 +583,73 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
       disposeGroupMeshes(punchToolGroup);
       disposeGroupMeshes(dieToolGroup);
 
-      // Tooling station length matches part bending length (+ margin), capped at 4100 mm
-      const toolLenUnits = Math.min(beamLen, Math.max(42, st.part.widthMm * SCALE + 14));
+      // Finite 3D tool stations, using the SAME Z intervals as the collision engine.
+      const g = st.machine.collisionGeometry;
+      const spanMm = Math.max(1,Math.min(st.machine.bendingLengthMm, g.toolLengthMm ?? Math.max(420, st.part.widthMm + 140)));
+      const zOffset = g.toolOffsetZMm ?? 0;
+      const fallback = [{startMm:zOffset-spanMm/2,endMm:zOffset+spanMm/2}];
+      const punchStations = g.punchStationsZMm?.length ? g.punchStationsZMm : fallback;
+      const dieStations = g.dieStationsZMm?.length ? g.dieStationsZMm : fallback;
+      const addStations = (
+        group: THREE.Group, profile: {x:number;y:number}[],
+        stations: {startMm:number;endMm:number}[], mirror: boolean, toolMaterial: THREE.Material
+      ) => {
+        for (const stn of stations) {
+          if (stn.endMm<=stn.startMm) continue;
+          const geo = makeExtrudedProfileGeometry(profile,(stn.endMm-stn.startMm)*SCALE,mirror);
+          const z = (stn.startMm+stn.endMm)*0.5*SCALE;
+          const mesh = new THREE.Mesh(geo,toolMaterial);
+          mesh.position.z=z;
+          mesh.castShadow=true;
+          mesh.receiveShadow=true;
+          group.add(mesh);
+          const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo,25),
+            new THREE.LineBasicMaterial({ color:0x94a3b8,transparent:true,opacity:0.45 }));
+          edges.position.z=z;
+          group.add(edges);
+        }
+      };
+      addStations(punchToolGroup,st.punch.profile2D,punchStations,st.punchReversed,punchMat);
+      addStations(dieToolGroup,st.die.profile2D,dieStations,false,dieMat);
 
-      // Punch extrusion
-      const pGeo = makeExtrudedProfileGeometry(st.punch.profile2D, toolLenUnits, st.punchReversed);
-      const pMesh = new THREE.Mesh(pGeo, punchMat);
-      pMesh.castShadow = true;
-      pMesh.receiveShadow = true;
-      punchToolGroup.add(pMesh);
-
-      const pEdges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(pGeo, 25),
-        new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.45 })
-      );
-      punchToolGroup.add(pEdges);
-
-      // Position RamBody + ClampBar right above punch height
+      // Synchronize rendered support solids with exact detection cross sections.
+      const oldClamp = clampBar.geometry;
+      clampBar.geometry = new THREE.BoxGeometry(g.clampHalfWidthMm * 2 * SCALE, 24 * SCALE, beamLen);
+      oldClamp.dispose();
+      const oldRam = ramBody.geometry;
+      ramBody.geometry = new THREE.BoxGeometry(g.ramHalfWidthMm * 2 * SCALE, g.ramBodyHeightMm * SCALE, beamLen);
+      oldRam.dispose();
+      for (let i = 0; i < layout.structuralRails.length; i++) {
+        const span = layout.structuralRails[i];
+        const len = (span.endMm - span.startMm) * SCALE;
+        const oldHolder = dieHolders[i].geometry;
+        dieHolders[i].geometry = new THREE.BoxGeometry(g.dieHolderHalfWidthMm * 2 * SCALE, g.dieHolderHeightMm * SCALE, len);
+        oldHolder.dispose();
+        const oldBed = lowerBeds[i].geometry;
+        lowerBeds[i].geometry = new THREE.BoxGeometry(g.bedHalfWidthMm * 2 * SCALE, 300 * SCALE, len);
+        oldBed.dispose();
+      }
       const pHeightUnits = st.punch.heightMm * SCALE;
-      clampBar.position.y = pHeightUnits + 1.2;
-      ramBody.position.y = pHeightUnits + 13.0;
-      rulerStrip.position.y = pHeightUnits + 5.5;
+      clampBar.position.y = pHeightUnits + 12 * SCALE;
+      ramBody.position.y = pHeightUnits + (24 + g.ramBodyHeightMm / 2) * SCALE;
+      rulerStrip.position.y = pHeightUnits + 55 * SCALE;
 
-      // Die extrusion
-      const dGeo = makeExtrudedProfileGeometry(st.die.profile2D, toolLenUnits, false);
-      const dMesh = new THREE.Mesh(dGeo, dieMat);
-      dMesh.castShadow = true;
-      dMesh.receiveShadow = true;
-      dieToolGroup.add(dMesh);
-
-      const dEdges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(dGeo, 25),
-        new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.45 })
-      );
-      dieToolGroup.add(dEdges);
+      const oldFingerL = bgFingerL.geometry, oldFingerR = bgFingerR.geometry;
+      bgFingerL.geometry = new THREE.BoxGeometry(g.backgaugeFingerDepthMm * SCALE,
+        g.backgaugeFingerHeightMm * SCALE, (g.backgaugeFingerWidthMm ?? 22) * SCALE);
+      bgFingerR.geometry = new THREE.BoxGeometry(g.backgaugeFingerDepthMm * SCALE,
+        g.backgaugeFingerHeightMm * SCALE, (g.backgaugeFingerWidthMm ?? 22) * SCALE);
+      oldFingerL.dispose();
+      if (oldFingerR !== oldFingerL) oldFingerR.dispose();
+      bgFingerL.position.x = -((g.backgaugeFingerDepthMm / 2) + 1) * SCALE;
+      bgFingerR.position.x = -((g.backgaugeFingerDepthMm / 2) + 1) * SCALE;
+      bgFingerL.position.y = (-8 + g.backgaugeFingerHeightMm / 2) * SCALE;
+      bgFingerR.position.y = (-8 + g.backgaugeFingerHeightMm / 2) * SCALE;
 
       // Adjust die holder & lower bed height to match die height
       const dHeightUnits = st.die.heightMm * SCALE;
-      dieHolder.position.y = -dHeightUnits - 1.25;
-      lowerBed.position.y = -dHeightUnits - 17.5;
+      for (const dieHolder of dieHolders) dieHolder.position.y = -dHeightUnits - (g.dieHolderHeightMm / 2) * SCALE;
+      for (const lowerBed of lowerBeds) lowerBed.position.y = -dHeightUnits - (g.dieHolderHeightMm + 150) * SCALE;
       boltInst.position.y = -dHeightUnits + 5.95;
     };
 
@@ -588,7 +671,8 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
         st.part,
         st.punch,
         st.die,
-        st.punchReversed
+        st.punchReversed,
+        st.machine
       );
 
       // Tooling solid material defaults
@@ -610,9 +694,11 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
       // Update Ram & Backgauge Positions
       ramGroup.position.y = frame.punchTipY * SCALE;
       backgaugeGroup.position.set(frame.backgaugeXMm * SCALE, frame.backgaugeRMm * SCALE, 0);
-      const zSpread = Math.min(165, Math.max(4, st.part.widthMm * SCALE * 0.34));
+      const separation = st.machine.collisionGeometry.backgaugeFingerSeparationMm ?? Math.min(3300,Math.max(80,st.part.widthMm*0.68));
+      const zSpread = separation*0.5*SCALE;
       bgFingerL.position.z = -zSpread;
       bgFingerR.position.z = zSpread;
+      sheetGroup.position.z = (st.machine.collisionGeometry.partOffsetZMm ?? 0) * SCALE;
 
       // Rebuild Sheet Metal 3D Geometry cleanly
       disposeGroupMeshes(sheetGroup);
@@ -742,6 +828,24 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
         }
       }
 
+      // All planned bending axes, including untouched flat sheet joints.
+      for (const mark of getBendMarks(frame, st.part, st.steps, st.currentStepIdx)) {
+        const z1=-halfW*0.985,z2=halfW*0.985;
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(mark.xMm*SCALE,mark.yMm*SCALE,z1),
+          new THREE.Vector3(mark.xMm*SCALE,mark.yMm*SCALE,z2),
+        ]);
+        const lineMat = new THREE.LineDashedMaterial({
+          color:mark.active?0x38bdf8:mark.completed?0xf59e0b:0x1e40af,
+          dashSize:0.9,gapSize:0.5,depthTest:false,transparent:true,
+          opacity:mark.active?1:0.96,
+        });
+        const line = new THREE.Line(lineGeo,lineMat);
+        line.computeLineDistances();
+        line.renderOrder=30;
+        sheetGroup.add(line);
+      }
+
       if (linePositions.length > 0) {
         const outlineGeo = new THREE.BufferGeometry();
         outlineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
@@ -775,19 +879,21 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
         });
 
         // Line-of-contact bar along Z + end spheres
-        const barGeo = new THREE.CylinderGeometry(0.16, 0.16, partWidthUnits * 1.04, 10);
+        const contactZ=(ev.contactPoint3Dmm?.z ?? 0)*SCALE;
+        const overlapLen=Math.max(0.6,(ev.overlapWidthMm ?? 10)*SCALE);
+        const barGeo = new THREE.CylinderGeometry(0.16, 0.16, overlapLen, 10);
         barGeo.rotateX(Math.PI / 2);
         const barMesh = new THREE.Mesh(barGeo, markerMat);
-        barMesh.position.set(cx, cy, 0);
+        barMesh.position.set(cx, cy, contactZ);
         collisionMarkersGroup.add(barMesh);
 
         const sphereGeo = new THREE.SphereGeometry(0.85, 16, 12);
         const sphereFront = new THREE.Mesh(sphereGeo, wireMat);
-        sphereFront.position.set(cx, cy, partWidthUnits * 0.52);
+        sphereFront.position.set(cx, cy, contactZ + overlapLen*0.5);
         collisionMarkersGroup.add(sphereFront);
 
         const sphereBack = new THREE.Mesh(sphereGeo.clone(), wireMat.clone());
-        sphereBack.position.set(cx, cy, -partWidthUnits * 0.52);
+        sphereBack.position.set(cx, cy, contactZ - overlapLen*0.5);
         collisionMarkersGroup.add(sphereBack);
       }
     };
@@ -805,129 +911,82 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
       camTransitioning = false;
     });
 
-    // Render loop & on-demand scheduling
-    let frameId = 0;
-    let renderBusy = false;
-    let renderDirty = false;
-    let lastTime = performance.now();
+    // No renderBusy latch and no separate playback RAF that cancels camera frames.
+    // In software rendering mode we only throttle the number of canvas draws.
+    let pausedByCollision = false;
+    const frameLoop = createFrameLoop((delta) => {
+      const st = stateRef.current;
 
-    function afterDraw(cb: () => void) {
-      const gl = renderer.getContext() as WebGL2RenderingContext;
-      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-      gl.flush();
-      const poll = () => {
-        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-        if (state === gl.UNSIGNALED) {
-          frameId = window.setTimeout(poll, 5);
-        } else {
-          if (sync) gl.deleteSync(sync);
-          frameId = window.setTimeout(cb, 80);
+      if (camTransitioning) {
+        const dampFactor = 1 - Math.exp(-7.5 * delta);
+        camera.position.lerp(_targetCamPos, dampFactor);
+        controls.target.lerp(_targetControlsTarget, dampFactor);
+        if (
+          camera.position.distanceTo(_targetCamPos) < 0.08 &&
+          controls.target.distanceTo(_targetControlsTarget) < 0.05
+        ) {
+          camera.position.copy(_targetCamPos);
+          controls.target.copy(_targetControlsTarget);
+          camTransitioning = false;
         }
-      };
-      frameId = window.setTimeout(poll, 5);
-    }
-
-    const requestRender = () => {
-      if (stateRef.current.isPlaying || camTransitioning) return;
-      if (renderBusy) {
-        renderDirty = true;
-        return;
       }
-      renderBusy = true;
-      frameId = requestAnimationFrame(() => {
-        renderDirty = false;
-        controls.update();
-        renderer.render(scene, camera);
-        const done = () => {
-          renderBusy = false;
-          if (renderDirty) requestRender();
-        };
-        if (isSoftwareGl) afterDraw(done);
-        else done();
-      });
-    };
 
-    const startActiveLoop = () => {
-      cancelAnimationFrame(frameId);
-      clearTimeout(frameId);
-      lastTime = performance.now();
+      if (st.isPlaying && !pausedByCollision) {
+        const nextU = st.strokeProgress + delta * 0.38 * st.playbackSpeed;
+        const clampedU = Math.min(1.0, nextU);
+        const stop = findFirstBlockingFrame(
+          (u) => evaluateKinematics(
+            st.part, st.material, st.punch, st.die, st.steps,
+            st.currentStepIdx, u, st.compensateSpringback, st.customKFactor
+          ),
+          (frame) => detectFrameCollisions(
+            frame, st.part, st.punch, st.die, st.punchReversed, st.machine
+          ),
+          st.strokeProgress,
+          clampedU,
+        );
 
-      const tick = () => {
-        const now = performance.now();
-        const delta = Math.min(0.05, (now - lastTime) / 1000);
-        lastTime = now;
-
-        const st = stateRef.current;
-        let stillActive = false;
-
-        if (camTransitioning) {
-          stillActive = true;
-          const dampFactor = 1 - Math.exp(-7.5 * delta);
-          camera.position.lerp(_targetCamPos, dampFactor);
-          controls.target.lerp(_targetControlsTarget, dampFactor);
-          if (
-            camera.position.distanceTo(_targetCamPos) < 0.08 &&
-            controls.target.distanceTo(_targetControlsTarget) < 0.05
-          ) {
-            camera.position.copy(_targetCamPos);
-            controls.target.copy(_targetControlsTarget);
-            camTransitioning = false;
-          }
-        }
-
-        if (st.isPlaying) {
-          const nextU = st.strokeProgress + delta * 0.38 * st.playbackSpeed;
-          const clampedU = Math.min(1.0, nextU);
-          const nextFrame = evaluateKinematics(
-            st.part,
-            st.material,
-            st.punch,
-            st.die,
-            st.steps,
-            st.currentStepIdx,
-            clampedU,
-            st.compensateSpringback,
-            st.customKFactor
-          );
-          const nextCollisions = detectFrameCollisions(
-            nextFrame,
-            st.part,
-            st.punch,
-            st.die,
-            st.punchReversed
-          );
-
-          if (nextCollisions.some((c) => c.severity === 'critical')) {
-            st.onStrokeChange(clampedU);
-            st.onStopPlay();
-            stillActive = false;
-          } else if (nextU >= 1.0) {
-            stillActive = true;
-            if (st.currentStepIdx < st.steps.length - 1) {
-              st.onStepChange(st.currentStepIdx + 1);
-              st.onStrokeChange(0);
-            } else {
-              st.onStrokeChange(1.0);
-              st.onStopPlay();
-              stillActive = false;
-            }
+        if (stop) {
+          // Freeze ONLY at actual contact with a machine/tool surface.
+          // Diagnostic near-clearance warnings do not stop the animation.
+          // The renderer and OrbitControls must keep working normally.
+          pausedByCollision = true;
+          setCollisionPaused(true);
+          st.onStrokeChange(stop.frame.strokeProgress);
+          st.onStopPlay();
+        } else if (nextU >= 1.0) {
+          if (st.currentStepIdx < st.steps.length - 1) {
+            st.onStepChange(st.currentStepIdx + 1);
+            st.onStrokeChange(0);
           } else {
-            stillActive = true;
-            st.onStrokeChange(nextU);
+            st.onStrokeChange(1.0);
+            st.onStopPlay();
           }
+        } else {
+          st.onStrokeChange(nextU);
         }
+      }
 
-        controls.update();
-        renderer.render(scene, camera);
+      // OrbitControls is updated on every requested frame, including while
+      // bending is paused by collision. Its `change` event requests more frames
+      // as needed for drag, zoom, pan and damping.
+      controls.update();
+      renderer.render(scene, camera);
+      return (st.isPlaying && !pausedByCollision) || camTransitioning;
+    }, {
+      requestFrame: isSoftwareGl
+        ? (callback) => window.setTimeout(() => callback(performance.now()), 32)
+        : (callback) => requestAnimationFrame(callback),
+      cancelFrame: isSoftwareGl
+        ? (id) => window.clearTimeout(id)
+        : (id) => cancelAnimationFrame(id),
+    });
 
-        if (stillActive) {
-          if (isSoftwareGl) afterDraw(tick);
-          else frameId = requestAnimationFrame(tick);
-        }
-      };
-
-      if (isSoftwareGl) afterDraw(tick);
-      else frameId = requestAnimationFrame(tick);
+    const requestRender = () => frameLoop.invalidate();
+    const startActiveLoop = () => {
+      pausedByCollision = false;
+      setCollisionPaused(false);
+      frameLoop.beginAnimation();
     };
 
     controls.addEventListener('change', requestRender);
@@ -947,6 +1006,39 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
       requestRender,
       rebuildTooling,
       updateDynamicFrame,
+      setCameraSensitivity,
+      restoreMainView: () => {
+        camTransitioning = false;
+        const home = absoluteMainCamera(returnCameraView, stateRef.current.part.widthMm);
+        const dampingWasEnabled = controls.enableDamping;
+        // Cancel accumulated OrbitControls movement; otherwise a drag can
+        // continue rotating the camera immediately after pressing "Powrót".
+        controls.enableDamping = false;
+        camera.position.set(...home.pos);
+        controls.target.set(...home.target);
+        camera.up.set(0, 1, 0);
+        controls.saveState();
+        controls.reset();
+        controls.update();
+        controls.enableDamping = dampingWasEnabled;
+        requestRender();
+      },
+      saveMainView: () => {
+        camTransitioning = false;
+        controls.update();
+        const width = stateRef.current.part.widthMm;
+        const currentWorld: MainCameraView = {
+          pos: [camera.position.x, camera.position.y, camera.position.z],
+          target: [controls.target.x, controls.target.y, controls.target.z],
+        };
+        const relative = relativeMainCamera(currentWorld, width);
+        if (!isMainCameraView(relative)) return;
+        returnCameraView = relative;
+        controls.saveState();
+        try {
+          window.localStorage.setItem(MAIN_CAMERA_STORAGE_KEY, JSON.stringify(relative));
+        } catch { /* browser storage may be disabled */ }
+      },
     };
 
     // Initial render
@@ -956,13 +1048,13 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     (sceneRefs.current as any).startActiveLoop = startActiveLoop;
 
     return () => {
-      cancelAnimationFrame(frameId);
-      clearTimeout(frameId);
+      frameLoop.dispose();
       window.removeEventListener('resize', onResize);
       renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
       renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       controls.dispose();
       rulerTex.dispose();
+      disposeGroupMeshes(machineGroup);
       disposeGroupMeshes(punchToolGroup);
       disposeGroupMeshes(dieToolGroup);
       disposeGroupMeshes(sheetGroup);
@@ -974,13 +1066,20 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     };
   }, []);
 
+  // React updates only the control speeds, without recreating the Three.js scene.
+  useEffect(() => {
+    sceneRefs.current?.setCameraSensitivity(cameraSensitivity);
+    try { window.localStorage.setItem(CAMERA_SENSITIVITY_KEY, String(cameraSensitivity)); }
+    catch { /* localStorage may be unavailable */ }
+  }, [cameraSensitivity]);
+
   // Rebuild tooling meshes when punch, die, punchReversed, or part width changes
   useEffect(() => {
     if (!sceneRefs.current) return;
     sceneRefs.current.rebuildTooling();
     sceneRefs.current.updateDynamicFrame();
     sceneRefs.current.requestRender();
-  }, [punch, die, punchReversed, part.widthMm]);
+  }, [punch, die, punchReversed, part.widthMm, machine]);
 
   // Update dynamic sheet deformation & collisions whenever kinematic state changes
   useEffect(() => {
@@ -995,7 +1094,14 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
     strokeProgress,
     compensateSpringback,
     customKFactor,
+    machine,
   ]);
+
+  // An edited workpiece/tool or selected step is a new situation, not the
+  // original collision stop. Manual stroke scrubbing is handled below.
+  useEffect(() => {
+    setCollisionPaused(false);
+  }, [part, machine, punch, die, punchReversed, steps, currentStepIdx]);
 
   // Trigger active playback loop when isPlaying turns true
   useEffect(() => {
@@ -1005,6 +1111,12 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
   }, [isPlaying]);
 
   const activeBend = part.bends[currentFrame.activeBendIndex];
+  const restoreBendingView = () => {
+    setCollisionPaused(false);
+    onStopPlay();
+    onStrokeChange(0.80); // Almost full bend: best visibility before springback.
+    sceneRefs.current?.restoreMainView();
+  };
 
   return (
     <div className="relative w-full h-full overflow-hidden bg-[#0B1017] select-none">
@@ -1020,11 +1132,56 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
         </div>
       )}
 
+      {/* Return to near-frontal bend close-up at 80%. Save a precise user-adjusted
+          view if the default approximation differs from the physical screenshot. */}
+      <div className="absolute top-3 right-3 z-30 flex items-center gap-2">
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setCameraPanelOpen(p => !p)}
+            title="Ustawienia poruszania kamerą 3D"
+            aria-expanded={cameraPanelOpen}
+            className="flex items-center gap-1.5 rounded-md border border-slate-600/70 bg-[#142131]/95 px-2.5 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700/95 shadow-lg cursor-pointer"
+          ><SlidersHorizontal className="w-4 h-4" /><span className="hidden sm:inline">Kamera</span></button>
+          {cameraPanelOpen && (
+            <div className="absolute right-0 top-11 w-72 rounded-lg border border-slate-600 bg-[#111b28]/98 p-3 shadow-2xl text-slate-200">
+              <label htmlFor="camera-sensitivity" className="mb-1 flex justify-between text-xs font-medium">
+                <span>Czułość kamery</span><span className="font-mono text-sky-300">{cameraSensitivity}%</span>
+              </label>
+              <input id="camera-sensitivity" aria-label="Czułość kamery" type="range" min={20} max={100} step={5}
+                value={cameraSensitivity}
+                onChange={(e) => setCameraSensitivity(clampCameraSensitivity(Number(e.target.value)))}
+                className="w-full accent-sky-500 cursor-pointer" />
+              <div className="mt-2 space-y-1 text-[11px] leading-5 text-slate-400">
+                <p>Lewy przycisk myszy: obrót</p>
+                <p>Prawy przycisk: przesuwanie widoku</p>
+                <p>Kółko: płynne przybliżanie / oddalanie</p>
+              </div>
+              <button type="button" className="mt-3 text-[11px] text-sky-300 hover:text-white"
+                onClick={() => setCameraSensitivity(DEFAULT_CAMERA_SENSITIVITY)}>Przywróć domyślną czułość</button>
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => { sceneRefs.current?.saveMainView(); setViewSaved(true); }}
+          title="Zapisz obecne ustawienie kamery jako docelowy widok przycisku Powrót"
+          aria-label="Zapisz aktualny widok kamery"
+          className="flex items-center gap-1.5 rounded-md border border-slate-600/70 bg-[#142131]/95 px-2.5 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700/95 shadow-lg cursor-pointer"
+        ><Camera className="w-4 h-4" /><span className="hidden sm:inline">{viewSaved ? 'Widok zapisany' : 'Zapisz widok'}</span></button>
+        <button
+          type="button"
+          onClick={restoreBendingView}
+          title="Powrót do bliskiego widoku gięcia (80% skoku)"
+          className="flex items-center gap-2 rounded-md border border-sky-500/60 bg-[#142131]/95 px-3 py-2 text-xs font-semibold text-sky-100 hover:bg-sky-800/95 shadow-lg cursor-pointer"
+        ><CornerUpLeft className="w-4 h-4" />Powrót</button>
+      </div>
+
       {/* Top-Left Compact Telemetry Overlay (Clean CAD Readout, No Pills) */}
       <div className="absolute top-3 left-3 z-10 pointer-events-none flex flex-col gap-1.5">
         <div className="bg-[#121923]/92 border border-slate-700/70 rounded-md px-3 py-2 pointer-events-auto shadow-lg">
           <div className="text-[11px] font-medium text-sky-400 mb-0.5">
-            {DEFAULT_MACHINE.manufacturer} {DEFAULT_MACHINE.model} · {DEFAULT_MACHINE.tonnageTons} t / {DEFAULT_MACHINE.bendingLengthMm} mm
+            {machine.manufacturer} {machine.model} · {machine.tonnageTons} t / {machine.bendingLengthMm} mm
           </div>
           <div className="flex items-center gap-3 text-xs">
             <span className="font-semibold text-slate-100">
@@ -1070,7 +1227,7 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
             <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
             <div className="text-xs">
               <div className="font-semibold text-red-200">
-                Wykryto kolizję ({criticalEvents.length}) · Penetracja:{' '}
+                Kontakt z przeszkodą ({criticalEvents.length}) · Penetracja modelu:{' '}
                 <span className="font-mono tabular-nums">
                   {Math.max(...criticalEvents.map((c) => c.penetrationMm)).toFixed(2)} mm
                 </span>
@@ -1083,10 +1240,10 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
             <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
             <div className="text-xs">
               <div className="font-semibold text-red-200">
-                Przekroczony nacisk prasy ({currentFrame.springback.bendingForceKn} kN &gt; {DEFAULT_MACHINE.maxForceKn} kN)
+                Przekroczony nacisk prasy ({currentFrame.springback.bendingForceKn} kN &gt; {machine.maxForceKn} kN)
               </div>
               <div className="text-red-300/90 mt-0.5">
-                Wymagana siła gięcia przekracza maksymalny tonaż prasy {DEFAULT_MACHINE.model}.
+                Wymagana siła gięcia przekracza maksymalny tonaż prasy {machine.model}.
               </div>
             </div>
           </div>
@@ -1095,7 +1252,7 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
             <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
             <div className="text-xs">
               <div className="font-semibold text-red-200">
-                Poza zakresem zderzaka X ({Math.abs(currentFrame.backgaugeXMm).toFixed(1)} mm &gt; {DEFAULT_MACHINE.backgaugeXMaxMm} mm)
+                Poza zakresem zderzaka X ({Math.abs(currentFrame.backgaugeXMm).toFixed(1)} mm &gt; {machine.backgaugeXMaxMm} mm)
               </div>
               <div className="text-red-300/90 mt-0.5">
                 Ramię tylne wykracza poza maksymalny wysięg osi X.
@@ -1108,11 +1265,21 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
             <span className="text-xs text-amber-200">{warningEvents[0].message}</span>
           </div>
         ) : (
-          <div className="bg-emerald-950/85 border border-emerald-600/40 rounded-md px-3 py-1.5 pointer-events-auto flex items-center gap-2 w-fit shadow-md">
-            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-            <span className="text-xs text-emerald-200">Gięcie możliwe · tor bezkolizyjny</span>
+          <div className="bg-slate-900/90 border border-slate-600/50 rounded-md px-3 py-1.5 pointer-events-auto flex items-center gap-2 w-fit shadow-md">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="text-xs text-slate-200">Kolizji nie wykryto w tej klatce. Wykonalność niepotwierdzona*</span>
           </div>
         )}
+      </div>
+
+      {collisionPaused && !isPlaying && (
+        <div className="absolute left-3 top-[165px] z-10 pointer-events-none rounded-md border border-amber-600/60 bg-amber-950/90 px-3 py-2 text-xs text-amber-100 shadow-lg max-w-[340px]">
+          Gięcie zatrzymane na pierwszym kontakcie materiału z modelem maszyny. Kamera pozostaje aktywna. Ostrzeżenia o małym prześwicie nie zatrzymują symulacji.
+        </div>
+      )}
+
+      <div className="absolute top-[132px] left-3 z-10 pointer-events-none text-[10px] text-slate-400 bg-[#0b1017]/80 rounded px-2 py-1 max-w-[340px]">
+        * Model brył o stałym przekroju wzdłuż Z. Obrysy narzędzi i korpusu muszą być zmierzone.
       </div>
 
       {/* Collapsible Bottom Simulation Dock */}
@@ -1133,6 +1300,8 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    setCollisionPaused(false);
+                    onStopPlay();
                     onStepChange(Math.max(0, currentStepIdx - 1));
                     onStrokeChange(0);
                   }}
@@ -1153,6 +1322,8 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    setCollisionPaused(false);
+                    onStopPlay();
                     onStepChange(Math.min(steps.length - 1, currentStepIdx + 1));
                     onStrokeChange(0);
                   }}
@@ -1164,7 +1335,7 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={onResetSim}
+                  onClick={() => { setCollisionPaused(false); onResetSim(); }}
                   title="Resetuj cykl do kroku 1"
                   className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
                 >
@@ -1181,7 +1352,11 @@ export const PressBrakeViewport: React.FC<PressBrakeViewportProps> = ({
                     max={1}
                     step={0.005}
                     value={strokeProgress}
-                    onChange={(e) => onStrokeChange(parseFloat(e.target.value))}
+                    onChange={(e) => {
+                      setCollisionPaused(false);
+                      onStopPlay();
+                      onStrokeChange(parseFloat(e.target.value));
+                    }}
                     aria-label="Postęp skoku suwaka prasy"
                     className="w-full h-1.5 bg-slate-700 rounded-lg cursor-pointer"
                   />

@@ -8,19 +8,21 @@ import {
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
-import { DEFAULT_MACHINE, DIE_TOOLS, PUNCH_TOOLS } from '../data/library';
+
 import { turnToIncludedAngleDeg } from '../engine/bendingMath';
 import {
   BendStepConfig,
   CollisionEvent,
   DieTool,
   PartDefinition,
+  PressMachineSpec,
   PunchTool,
   SheetMaterial,
   StepSimulationReport,
   WorkspaceTab,
 } from '../types/bending';
 import { NumericField } from './NumericField';
+import { ToolProfileEditor } from './ToolProfileEditor';
 
 interface RightInspectorPanelProps {
   activeTab: WorkspaceTab;
@@ -28,6 +30,8 @@ interface RightInspectorPanelProps {
   material: SheetMaterial;
   punch: PunchTool;
   die: DieTool;
+  machine: PressMachineSpec;
+  onUpdateMachine: (machine: PressMachineSpec) => void;
   punchReversed: boolean;
   compensateSpringback: boolean;
   customKFactor: number | undefined;
@@ -35,6 +39,10 @@ interface RightInspectorPanelProps {
   steps: BendStepConfig[];
   stepReports: StepSimulationReport[];
   currentStepIdx: number;
+  punchList: PunchTool[];
+  dieList: DieTool[];
+  onSavePunch: (tool: PunchTool) => void;
+  onSaveDie: (tool: DieTool) => void;
   onSelectPunch: (punchId: string) => void;
   onSelectDie: (dieId: string) => void;
   onTogglePunchReversed: () => void;
@@ -50,6 +58,8 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
   material,
   punch,
   die,
+  machine,
+  onUpdateMachine,
   punchReversed,
   compensateSpringback,
   customKFactor,
@@ -57,6 +67,10 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
   steps,
   stepReports,
   currentStepIdx,
+  punchList,
+  dieList,
+  onSavePunch,
+  onSaveDie,
   onSelectPunch,
   onSelectDie,
   onTogglePunchReversed,
@@ -71,9 +85,13 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
   const tonnageExceededAny = stepReports.some((r) => r.tonnageExceeded);
   const backgaugeOutAny = stepReports.some((r) => r.backgaugeOutOfRange);
   const shortFlangeAny = stepReports.some((r) => r.springback.flangeTooShort);
+  const toolLoadAny = stepReports.some((r) => r.toolLoadExceeded);
+  const lengthOverAny = stepReports.some((r) => r.bendingLengthExceeded);
+  const incompleteSampling = stepReports.some((r) => !r.samplingConverged);
+  const missingToolingCoverage = stepReports.some((r) => !r.toolingCoversSheetWidth);
 
-  const isImpossible = criticalCount > 0 || tonnageExceededAny || backgaugeOutAny;
-  const hasWarnings = !isImpossible && (warningCount > 0 || shortFlangeAny);
+  const isImpossible = criticalCount > 0 || tonnageExceededAny || backgaugeOutAny || toolLoadAny || lengthOverAny || missingToolingCoverage;
+  const hasWarnings = !isImpossible && (warningCount > 0 || shortFlangeAny || incompleteSampling);
   const activeReport = stepReports[currentStepIdx];
 
   return (
@@ -91,14 +109,14 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               ? 'text-red-400'
               : hasWarnings
                 ? 'text-amber-400'
-                : 'text-emerald-400'
+                : 'text-slate-300'
           }`}
         >
           {isImpossible
-            ? 'Niemożliwe'
+            ? 'Kolizja / limit'
             : hasWarnings
               ? `${warningCount} ostrzeżeń`
-              : 'Możliwe'}
+              : 'Niepotwierdzone'}
         </span>
       </div>
 
@@ -114,7 +132,7 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                   ? 'bg-red-950/45 border-red-600/60 text-red-100'
                   : hasWarnings
                     ? 'bg-amber-950/40 border-amber-600/60 text-amber-100'
-                    : 'bg-emerald-950/35 border-emerald-600/50 text-emerald-100'
+                    : 'bg-slate-800/70 border-slate-600 text-slate-100'
               }`}
             >
               {isImpossible ? (
@@ -122,31 +140,41 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               ) : hasWarnings ? (
                 <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
               ) : (
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                <ShieldAlert className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
               )}
               <div className="text-xs space-y-1">
                 <div className="font-semibold">
                   {isImpossible
-                    ? 'Gięcie w ten sposób jest niemożliwe'
+                    ? 'Wykryto kolizję lub przekroczenie limitu w modelu'
                     : hasWarnings
-                      ? 'Gięcie możliwe z uwagami technologicznymi'
-                      : 'Gięcie jest możliwe w zadanej konfiguracji'}
+                      ? 'Nie można potwierdzić wykonalności'
+                      : 'Brak potwierdzenia: geometria narzędzi przybliżona'}
                 </div>
                 <div className="text-[11px] opacity-85 leading-relaxed">
                   {isImpossible
                     ? [
                         criticalCount > 0 ? `${criticalCount} kolizji narzędzia/korpusu` : null,
-                        tonnageExceededAny ? `przekroczony nacisk ${DEFAULT_MACHINE.maxForceKn} kN` : null,
-                        backgaugeOutAny ? `przekroczony wysięg zderzaka ${DEFAULT_MACHINE.backgaugeXMaxMm} mm` : null,
+                        tonnageExceededAny ? `przekroczony nacisk ${machine.maxForceKn} kN` : null,
+                        backgaugeOutAny ? `przekroczony wysięg zderzaka ${machine.backgaugeXMaxMm} mm` : null,
+                        toolLoadAny ? 'przeciążone narzędzie' : null,
+                        lengthOverAny ? 'przekroczona długość robocza' : null,
+                        missingToolingCoverage ? 'brak pokrycia całej długości linii przez stempel / matrycę' : null,
                       ]
                         .filter(Boolean)
                         .join(' · ')
                     : hasWarnings
-                      ? 'Brak twardych kolizji, ale występują małe prześwity lub krótkie ramię oporowe na matrycy V.'
-                      : `Wszystkie ${steps.length} zagięcia przechodzą bezkolizyjnie w limitach prasy ${DEFAULT_MACHINE.manufacturer} ${DEFAULT_MACHINE.model}.`}
+                      ? 'Sprawdź wykryte prześwity i kompletność próbkowania. Brak zderzenia nie jest gwarancją wykonalności.'
+                      : `W ${steps.length} gięciach nie wykryto przenikania brył. Uproszczone obrysy narzędzi i prowadzenie detalu nie pozwalają wykluczyć zderzenia na Twojej prasie.`}
                 </div>
               </div>
             </div>
+
+            {part.id === 'channel-c-50-80-50' && (
+              <div className="border border-amber-600/50 bg-amber-950/25 rounded-md p-3 text-[11px] text-amber-100 space-y-1">
+                <div className="font-semibold">Profil C 50×80×50: zgłoszona kolizja na rzeczywistej maszynie</div>
+                <div>Ten preset ma przykładową grubość 2 mm, promień i długość gięcia. Jeśli model nie wykrywa przecięcia, sprawdź ostrzeżenie o prześwicie i wprowadź dokładny obrys stempla, jego mocowania, matrycy i uchwytów. Wynik nie oznacza możliwości wykonania detalu.</div>
+              </div>
+            )}
 
             {/* Active Step Telemetry Grid */}
             {activeReport && (
@@ -187,13 +215,32 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                 )}
                 {activeReport.tonnageExceeded && (
                   <div className="text-[11px] text-red-200 bg-red-950/70 border border-red-600/60 rounded px-2.5 py-1.5">
-                    Przekroczony nacisk prasy {DEFAULT_MACHINE.model}: wymagane{' '}
-                    {activeReport.springback.bendingForceKn} kN &gt; {DEFAULT_MACHINE.maxForceKn} kN!
+                    Przekroczony nacisk prasy {machine.model}: wymagane{' '}
+                    {activeReport.springback.bendingForceKn} kN &gt; {machine.maxForceKn} kN!
                   </div>
                 )}
+                {!activeReport.toolingCoversSheetWidth && (
+                    <div className="text-[11px] text-red-200 bg-red-950/70 border border-red-600/60 rounded px-2.5 py-1.5">
+                      Stempel lub matryca nie pokrywa całej długości gięcia w osi Z. Taki wynik „brak kolizji” jest nieważny.
+                    </div>
+                  )}
+                {activeReport.toolLoadExceeded && (
+                  <div className="text-[11px] text-red-200 bg-red-950/70 border border-red-600/60 rounded px-2.5 py-1.5">
+                    Obciążenie narzędzia przekracza limit kN/m dla wybranego stempla lub matrycy.
+                  </div>
+                )}
+                {activeReport.bendingLengthExceeded && (
+                  <div className="text-[11px] text-red-200 bg-red-950/70 border border-red-600/60 rounded px-2.5 py-1.5">
+                    Długość gięcia przekracza {machine.bendingLengthMm} mm.
+                  </div>
+                )}
+                <div className="text-[11px] text-slate-400">
+                  Przeanalizowano {activeReport.checkedFrames} pozycji skoku
+                  {!activeReport.samplingConverged && <span className="text-red-300"> · osiągnięto limit zagęszczania, wynik niepełny</span>}.
+                </div>
                 {activeReport.backgaugeOutOfRange && (
                   <div className="text-[11px] text-red-200 bg-red-950/70 border border-red-600/60 rounded px-2.5 py-1.5">
-                    Poza zakresem osi X zderzaka ({Math.abs(activeReport.backgaugeXMm).toFixed(1)} mm &gt; {DEFAULT_MACHINE.backgaugeXMaxMm} mm).
+                    Poza zakresem osi X zderzaka ({Math.abs(activeReport.backgaugeXMm).toFixed(1)} mm &gt; {machine.backgaugeXMaxMm} mm).
                   </div>
                 )}
               </div>
@@ -204,13 +251,13 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
                   <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
-                  <span>Wykryte kolizje w sekwencji</span>
+                  <span>Wykryte kolizje w sekwencji (3D)</span>
                 </span>
               </div>
 
               {allCollisions.length === 0 ? (
                 <div className="border border-slate-800 bg-[#0E141D] rounded-md p-3 text-xs text-slate-300">
-                  Brak kolizji geometrycznych blachy ze stemplem, matrycą, stołem, korpusem i zderzakiem tylnym.
+                  Nie wykryto przenikania brył 3D w próbkach przebiegu gięcia. To nie potwierdza bezpieczeństwa ani wykonalności na rzeczywistej prasie.
                 </div>
               ) : (
                 <div className="space-y-2">
@@ -250,6 +297,9 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                         <span>Skok: {(ev.strokeProgress * 100).toFixed(0)}%</span>
                         <span>·</span>
                         <span>Kąt: {turnToIncludedAngleDeg(ev.angleAtCollisionDeg).toFixed(1)}°</span>
+                        {ev.contactPoint3Dmm && (
+                          <span title="Współrzędne kontaktu (mm)" className="text-sky-300">Z: {ev.contactPoint3Dmm.z.toFixed(1)} mm</span>
+                        )}
                         <span>·</span>
                         {ev.severity === 'critical' ? (
                           <span className="text-red-400">
@@ -266,6 +316,7 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                 </div>
               )}
             </div>
+
           </>
         )}
 
@@ -483,14 +534,14 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-[11px] text-sky-400 font-medium">
-                    {DEFAULT_MACHINE.manufacturer}
+                    {machine.manufacturer}
                   </div>
                   <div className="text-xs font-semibold text-slate-100">
-                    {DEFAULT_MACHINE.model}
+                    {machine.model}
                   </div>
                 </div>
                 <span className="text-xs font-mono tabular-nums font-semibold text-slate-200">
-                  {DEFAULT_MACHINE.tonnageTons} t / {DEFAULT_MACHINE.bendingLengthMm} mm
+                  {machine.tonnageTons} t / {machine.bendingLengthMm} mm
                 </span>
               </div>
 
@@ -503,11 +554,11 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                         activeReport.tonnageExceeded ? 'text-red-400 font-semibold' : 'text-sky-300'
                       }
                     >
-                      {activeReport.springback.bendingForceKn} / {DEFAULT_MACHINE.maxForceKn} kN (
+                      {activeReport.springback.bendingForceKn} / {machine.maxForceKn} kN (
                       {Math.min(
                         999,
                         Math.round(
-                          (activeReport.springback.bendingForceKn / DEFAULT_MACHINE.maxForceKn) *
+                          (activeReport.springback.bendingForceKn / machine.maxForceKn) *
                             100
                         )
                       )}
@@ -522,7 +573,7 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                       style={{
                         width: `${Math.min(
                           100,
-                          (activeReport.springback.bendingForceKn / DEFAULT_MACHINE.maxForceKn) *
+                          (activeReport.springback.bendingForceKn / machine.maxForceKn) *
                             100
                         )}%`,
                       }}
@@ -534,37 +585,121 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] font-mono tabular-nums text-slate-400 pt-1 border-t border-slate-800/80">
                 <div className="flex justify-between">
                   <span>Rozstaw kolumn:</span>
-                  <span className="text-slate-200">{DEFAULT_MACHINE.distanceBetweenColumnsMm} mm</span>
+                  <span className="text-slate-200">{machine.distanceBetweenColumnsMm} mm</span>
                 </div>
                 <div className="flex justify-between">
                   <span>Gardziel C:</span>
-                  <span className="text-slate-200">{DEFAULT_MACHINE.throatDepthMm} mm</span>
+                  <span className="text-slate-200">{machine.throatDepthMm} mm</span>
                 </div>
                 <div className="flex justify-between">
                   <span>Skok / Otwarcie:</span>
                   <span className="text-slate-200">
-                    {DEFAULT_MACHINE.strokeMm} / {DEFAULT_MACHINE.daylightMm}
+                    {machine.strokeMm} / {machine.daylightMm}
                   </span>
                 </div>
                 <div className="flex justify-between">
                   <span>Zderzak X max:</span>
-                  <span className="text-slate-200">{DEFAULT_MACHINE.backgaugeXMaxMm} mm</span>
+                  <span className="text-slate-200">{machine.backgaugeXMaxMm} mm</span>
                 </div>
                 <div className="flex justify-between">
                   <span>Prędkości Y:</span>
                   <span className="text-slate-200">
-                    {DEFAULT_MACHINE.approachSpeedMmS}/{DEFAULT_MACHINE.bendSpeedMmS}/
-                    {DEFAULT_MACHINE.returnSpeedMmS}
+                    {machine.approachSpeedMmS}/{machine.bendSpeedMmS}/
+                    {machine.returnSpeedMmS}
                   </span>
                 </div>
                 <div className="flex justify-between">
                   <span>Stół (szer.):</span>
-                  <span className="text-slate-200">{DEFAULT_MACHINE.tableWidthMm} mm</span>
+                  <span className="text-slate-200">{machine.tableWidthMm} mm</span>
                 </div>
               </div>
               <div className="text-[11px] text-slate-400 pt-1 border-t border-slate-800/80">
-                Mocowanie: <span className="text-slate-200">{DEFAULT_MACHINE.clampingSystem}</span>
+                Mocowanie: <span className="text-slate-200">{machine.clampingSystem}</span>
               </div>
+              <details className="border-t border-slate-800 pt-2">
+                <summary className="text-[11px] text-sky-300 cursor-pointer">Obrysy uchwytów i belki (wymiary zmierzone)</summary>
+                <p className="text-[10px] text-amber-300 my-2">
+                  Fabryczne wartości są poglądowe. Podaj półszerokości od osi gięcia i wymiary zmierzone na swojej prasie.
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  {([
+                    ['clampHalfWidthMm', 'Półszer. zacisku'],
+                    ['ramHalfWidthMm', 'Półszer. belki'],
+                    ['ramBodyHeightMm', 'Wys. belki'],
+                    ['dieHolderHalfWidthMm', 'Półszer. obsady matrycy'],
+                    ['dieHolderHeightMm', 'Wys. obsady matrycy'],
+                    ['bedHalfWidthMm', 'Półszer. stołu'],
+                    ['backgaugeFingerDepthMm', 'Głęb. palca zderzaka'],
+                    ['backgaugeFingerHeightMm', 'Wys. palca zderzaka'],
+                  ] as const).map(([field, label]) => (
+                    <label key={field} className="text-[10px] text-slate-400">
+                      {label} (mm)
+                      <input type="number" min="1" max="1000" step="0.5"
+                        value={machine.collisionGeometry[field]}
+                        onChange={(e) => {
+                          const n = Number(e.target.value);
+                          if (n > 0 && n <= 1000) onUpdateMachine({
+                            ...machine, collisionGeometry: { ...machine.collisionGeometry, [field]: n },
+                          });
+                        }}
+                        className="mt-1 w-full bg-[#121923] border border-slate-700 rounded p-1.5 text-xs font-mono text-slate-100"/>
+                    </label>
+                  ))}
+                </div>
+              </details>
+              <details className="border-t border-slate-800 pt-2" open>
+                <summary className="text-[11px] font-semibold text-sky-300 cursor-pointer">Rozmieszczenie narzędzi w osi Z (3D)</summary>
+                <p className="text-[10px] text-slate-400 my-2">Z = 0 oznacza środek prasy. Ustaw rzeczywistą długość narzędzi, położenie blachy i palców zderzaka.</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {([
+                    ['toolLengthMm', 'Długość narzędzia', Math.min(machine.bendingLengthMm, Math.max(420, part.widthMm + 140))],
+                    ['toolOffsetZMm', 'Przesunięcie narzędzia Z', 0],
+                    ['partOffsetZMm', 'Przesunięcie blachy Z', 0],
+                    ['backgaugeFingerSeparationMm', 'Rozstaw palców Z', Math.min(3300,Math.max(80,part.widthMm*.68))],
+                    ['backgaugeFingerWidthMm', 'Szerokość palca Z', 22],
+                  ] as const).map(([field, label, fallback]) => (
+                    <label key={field} className="text-[10px] text-slate-400">{label} (mm)
+                      <input type="number" step="1"
+                        value={machine.collisionGeometry[field] ?? fallback}
+                        onChange={e => {
+                          const n = Number(e.target.value);
+                          if (Number.isFinite(n)) onUpdateMachine({...machine,collisionGeometry:{...machine.collisionGeometry,[field]:n}});
+                        }}
+                        className="mt-1 w-full bg-[#121923] border border-slate-700 rounded p-1.5 text-xs font-mono text-slate-100" />
+                    </label>
+                  ))}
+                </div>
+                <p className="mt-2 text-[10px] text-slate-400">Opcjonalne segmenty stempla i matrycy: jeden przedział Z na linię, format <code>-250;0</code>. Zatwierdź zmianę poza polem.</p>
+                {(['punchStationsZMm','dieStationsZMm'] as const).map(field => (
+                  <label key={field} className="block text-[10px] text-slate-400 mt-2">
+                    {field==='punchStationsZMm'?'Segmenty stempla':'Segmenty matrycy'}
+                    <textarea key={`${field}-${machine.collisionGeometry[field]?.length ?? 0}`}
+                      defaultValue={(machine.collisionGeometry[field]??[]).map(seg => `${seg.startMm};${seg.endMm}`).join('\n')}
+                      placeholder="Puste = jedno narzędzie o długości podanej wyżej"
+                      onBlur={e => {
+                        const text = e.target.value.trim();
+                        const rows = text ? text.split(/\r?\n/).map(line => line.split(/[;,]/).map(Number)) : [];
+                        if (rows.some(row => row.length!==2 || row.some(v => !Number.isFinite(v)) || row[1]<=row[0])) { e.target.setCustomValidity('Błędny zakres. Wpisz start;koniec w mm'); e.target.reportValidity(); return; }
+                        e.target.setCustomValidity('');
+                        onUpdateMachine({...machine,collisionGeometry:{...machine.collisionGeometry,[field]:rows.map(([startMm,endMm])=>({startMm,endMm}))}});
+                      }}
+                      rows={2} className="mt-1 w-full resize-y bg-[#121923] border border-slate-700 rounded p-1.5 text-xs font-mono text-slate-100" />
+                  </label>
+                ))}
+              </details>
+              <label className="block text-[11px] text-amber-200 border-t border-slate-800 pt-2">
+                Margines kontrolny przy gotowych zagięciach (mm)
+                <input type="number" min="0" max="30" step="0.5"
+                  value={machine.collisionGeometry.minimumFreeClearanceMm ?? 8}
+                  onChange={e => {
+                    const n = Number(e.target.value);
+                    if (Number.isFinite(n) && n >= 0 && n <= 30)
+                      onUpdateMachine({...machine, collisionGeometry:{...machine.collisionGeometry, minimumFreeClearanceMm:n}});
+                  }}
+                  className="mt-1 w-full bg-[#121923] border border-amber-800 rounded p-1.5 text-xs font-mono text-slate-100" />
+                <span className="block mt-1 text-[10px] text-amber-300">8 mm to próg diagnostycznego ostrzeżenia, nie tolerancja bezpiecznej pracy. Ostrzeżenie NIE zatrzymuje gięcia. Odtwarzanie zatrzymuje się dopiero przy kontakcie obrysów w modelu.</span>
+              </label>
+              <p className="text-[10px] text-amber-300">Detektor 3D obsługuje bryły o stałym przekroju wzdłuż Z. Nie modeluje jeszcze dowolnych modeli STEP ani odkształceń kontaktowych. Domyślne wymiary korpusu są orientacyjne.</p>
             </div>
 
             <div className="space-y-2.5">
@@ -585,7 +720,7 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               </div>
 
               <div className="space-y-1.5">
-                {PUNCH_TOOLS.map((p) => {
+                {punchList.map((p) => {
                   const selected = p.id === punch.id;
                   return (
                     <button
@@ -626,6 +761,19 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                   );
                 })}
               </div>
+              <div className="rounded border border-amber-700/60 bg-amber-950/25 p-2 text-[10px] leading-relaxed text-amber-200">
+                Potwierdzone katalogowo: model, kąt, promień, wysokość i nośność.
+                <strong> Obrys kolizyjny stempla jest nadal szacunkowy!</strong> Etykieta narzędzia
+                nie zawiera wymiarów odsunięcia szyjki ani szczegółów uchwytu, które
+                mogą spowodować kolizję przy drugim gięciu profilu C.
+                {' '}<a className="underline" target="_blank" rel="noopener noreferrer"
+                  href={punch.code.startsWith('PS.')
+                    ? 'https://www.rolleritools.com/tools-6437/press-brakes/tools/type-r1-punches/ps13585r08-6700'
+                    : 'https://www.rolleritools.com/tools-6437/press-brakes/tools/type-r1-punches/top17560r5-6594'}>
+                  Dokumentacja Rolleri
+                </a>
+              </div>
+              <ToolProfileEditor kind="punch" tool={punch} onSave={onSavePunch} />
             </div>
 
             <div className="space-y-2.5 pt-2 border-t border-slate-800">
@@ -637,7 +785,7 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
               </div>
 
               <div className="space-y-1.5">
-                {DIE_TOOLS.map((d) => {
+                {dieList.map((d) => {
                   const selected = d.id === die.id;
                   return (
                     <button
@@ -663,6 +811,17 @@ export const RightInspectorPanel: React.FC<RightInspectorPanelProps> = ({
                   );
                 })}
               </div>
+              <div className="rounded border border-amber-700/60 bg-amber-950/25 p-2 text-[10px] leading-relaxed text-amber-200">
+                M.460.R to jeden korpus z czterema rowkami: V16, V22, V35 i V50, 85°.
+                Wybór V odpowiada obróceniu matrycy. <strong>Symulator przedstawia
+                uproszczony korpus z aktywnym rowkiem; pozostałe trzy rowki boczne
+                nie są jeszcze odwzorowane z rysunku producenta.</strong>
+                {' '}<a className="underline" target="_blank" rel="noopener noreferrer"
+                  href="https://www.rolleritools.com/tools-6437/press-brakes/tools/type-r1-dies/m460r-6802">
+                  Dokumentacja Rolleri
+                </a>
+              </div>
+              <ToolProfileEditor kind="die" tool={die} onSave={onSaveDie} />
             </div>
 
             <div className="space-y-2 pt-2 border-t border-slate-800">

@@ -29,6 +29,19 @@ export const PRESS_MACHINES: PressMachineSpec[] = [
     clampingSystem: 'Promecam / Europejski (szybkomocujący)',
     cncController: 'Delem DA-66T / ESA S640 (Y1, Y2, X, R + Crowning)',
     hasCrowning: true,
+    // Illustrative cross-section envelopes, NOT measured on the customer's press.
+    collisionGeometry: {
+      clampHalfWidthMm: 23,
+      ramHalfWidthMm: 34,
+      ramBodyHeightMm: 260,
+      dieHolderHalfWidthMm: 45,
+      dieHolderHeightMm: 25,
+      bedHalfWidthMm: 60,
+      backgaugeFingerDepthMm: 45,
+      backgaugeFingerHeightMm: 18,
+      // Diagnostic only. Check gaps smaller than this against an unmeasured tool contour.
+      minimumFreeClearanceMm: 8,
+    },
   },
 ];
 
@@ -154,15 +167,15 @@ function buildVDieProfile(vOpening: number, vAngleDeg: number, width: number, he
 export const PUNCH_TOOLS: PunchTool[] = [
   {
     id: 'rolleri-ps-135-85-r08-fx',
-    name: 'Rolleri PS.135.85.R08/FX (Prosty)',
-    code: 'PS.135.85.R08/FX',
+    name: 'Rolleri PS.135.85.R08 (85°, R0,8)',
+    code: 'PS.135.85.R08',
     type: 'straight',
     tipAngleDeg: 85,
     tipRadiusMm: 0.8,
     heightMm: 105,
-    maxLoadKnPerM: 981,
+    maxLoadKnPerM: 1000,
     description:
-      'Stempel prosty Rolleri (typ R1/Promecam): H:105+30 mm, kąt 85°, promień R0.8, maks. nacisk 100 t/m (981 kN/m), masa 21,2 kg/m.',
+      'Rolleri PS.135.85.R08: H robocza 105 mm, całkowita 135 mm, 85°, R0,8; obciążenie katalogowe 1000 kN/m. Masa ok. 21,2 kg/m. Kształt w symulacji jest SZACOWANY, nie wczytany z DXF. Wariant segmentacji FX nie jest potwierdzony na zdjęciu.',
     // Symmetric straight R1 punch: working height H=105mm (+30mm tang), 85° tip, R0.8, 25mm straight body
     profile2D: [
       { x: 0, y: 0 },
@@ -188,9 +201,9 @@ export const PUNCH_TOOLS: PunchTool[] = [
     tipAngleDeg: 60,
     tipRadiusMm: 5.0,
     heightMm: 145,
-    maxLoadKnPerM: 1570,
+    maxLoadKnPerM: 1600,
     description:
-      'Ciężki stempel prosty Rolleri (typ R1/Promecam): H:145+30 mm, kąt 60°, promień R5, maks. nacisk 160 t/m (1570 kN/m), masa 41,9 kg/m — do grubych blach.',
+      'Rolleri TOP.175.60.R5: H robocza 145 mm, całkowita 175 mm, 60°, R5; obciążenie katalogowe 1600 kN/m. Masa ok. 41 kg/m (21,5 kg przy długości 525 mm). Kształt w symulacji jest SZACOWANY, nie wczytany z DXF.',
     // Heavy straight R1 punch: working height H=145mm (+30mm tang), 60° tip, R5 nose, 38mm heavy body
     profile2D: [
       { x: 0, y: 0 },
@@ -210,56 +223,61 @@ export const PUNCH_TOOLS: PunchTool[] = [
   },
 ];
 
+// M.460.R: rzeczywista matryca czterorowkowa V16/22/35/50, 85°,
+// promienie odpowiednio R2/R2/R2/R3, dopuszczalne obciążenie 800 kN/m.
+// Cztery wpisy to UPROSZCZONE ustawienia jednego korpusu obróconego do aktywnego V.
+// Kształt bocznych i dolnych rowków NIE został odtworzony z DXF, więc test
+// kolizji z bokiem matrycy ma ograniczoną wiarygodność.
 export const DIE_TOOLS: DieTool[] = [
   {
     id: 'die-v16',
-    name: 'Rolleri M.460.R · V16 / 85°',
+    name: 'Rolleri M.460.R (4V) · V16 / 85°',
     code: 'M.460.R-V16',
     vOpeningMm: 16,
     vAngleDeg: 85,
     shoulderRadiusMm: 2.0,
     heightMm: 60,
     widthMm: 60,
-    maxLoadKnPerM: 785,
+    maxLoadKnPerM: 800,
     minFlangeMm: 11.5,
     profile2D: buildVDieProfile(16, 85, 60, 60),
   },
   {
     id: 'die-v22',
-    name: 'Rolleri M.460.R · V22 / 85°',
+    name: 'Rolleri M.460.R (4V) · V22 / 85°',
     code: 'M.460.R-V22',
     vOpeningMm: 22,
     vAngleDeg: 85,
     shoulderRadiusMm: 2.0,
     heightMm: 60,
     widthMm: 60,
-    maxLoadKnPerM: 785,
+    maxLoadKnPerM: 800,
     minFlangeMm: 15.5,
     profile2D: buildVDieProfile(22, 85, 60, 60),
   },
   {
     id: 'die-v35',
-    name: 'Rolleri M.460.R · V35 / 85°',
+    name: 'Rolleri M.460.R (4V) · V35 / 85°',
     code: 'M.460.R-V35',
     vOpeningMm: 35,
     vAngleDeg: 85,
     shoulderRadiusMm: 2.0,
     heightMm: 60,
     widthMm: 60,
-    maxLoadKnPerM: 785,
+    maxLoadKnPerM: 800,
     minFlangeMm: 24.5,
     profile2D: buildVDieProfile(35, 85, 60, 60),
   },
   {
     id: 'die-v50',
-    name: 'Rolleri M.460.R · V50 / 85°',
+    name: 'Rolleri M.460.R (4V) · V50 / 85°',
     code: 'M.460.R-V50',
     vOpeningMm: 50,
     vAngleDeg: 85,
     shoulderRadiusMm: 3.0,
     heightMm: 60,
     widthMm: 60,
-    maxLoadKnPerM: 785,
+    maxLoadKnPerM: 800,
     minFlangeMm: 35.0,
     profile2D: buildVDieProfile(50, 85, 60, 60),
   },
@@ -292,6 +310,19 @@ export const PART_PRESETS: PartDefinition[] = [
       { id: 'b1', label: 'G1', targetAngleDeg: 90, insideRadiusMm: 4.5 },
       { id: 'b2', label: 'G2', targetAngleDeg: 90, insideRadiusMm: 4.5 },
       { id: 'b3', label: 'G3', targetAngleDeg: 53, insideRadiusMm: 4.5 },
+    ],
+  },
+  {
+    id: 'channel-c-50-80-50',
+    name: 'Profil C 50×80×50 mm (sprawdzenie kolizji)',
+    description: 'Dwa gięcia 90°. Grubość 2 mm, długość gięcia 1000 mm i promień wewnętrzny 2.5 mm są WYŁĄCZNIE przykładowe. Wprowadź rzeczywiste wartości oraz obrysy narzędzi. Na Ermaksanie zgłoszono kolizję tego profilu, której domyślny stempel nie odwzorowywał.',
+    thicknessMm: 2,
+    widthMm: 1000,
+    materialId: 'dc01',
+    segmentLengthsMm: [50, 80, 50],
+    bends: [
+      { id: 'c50-g1', label: 'G1', targetAngleDeg: 90, insideRadiusMm: 2.5 },
+      { id: 'c50-g2', label: 'G2', targetAngleDeg: 90, insideRadiusMm: 2.5 },
     ],
   },
   {

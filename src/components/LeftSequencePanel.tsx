@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
-  CheckCircle2,
   FlipHorizontal2,
   Layers,
   Plus,
@@ -323,20 +322,24 @@ export const LeftSequencePanel: React.FC<LeftSequencePanelProps> = ({
                         <AlertTriangle className="w-3.5 h-3.5" />
                         <span>Kolizja</span>
                       </span>
-                    ) : rep?.tonnageExceeded || rep?.backgaugeOutOfRange ? (
+                    ) : rep?.tonnageExceeded || rep?.backgaugeOutOfRange || rep?.toolLoadExceeded || rep?.bendingLengthExceeded ? (
                       <span className="flex items-center gap-1 text-[11px] font-medium text-red-400 shrink-0">
                         <AlertTriangle className="w-3.5 h-3.5" />
                         <span>Limit prasy</span>
                       </span>
-                    ) : warnCount > 0 ? (
+                    ) : !rep?.toolingCoversSheetWidth ? (
+                      <span className="flex items-center gap-1 text-[11px] font-medium text-red-400 shrink-0">
+                        <AlertTriangle className="w-3.5 h-3.5" /><span>Brak narzędzia</span>
+                      </span>
+                    ) : warnCount > 0 || !rep?.samplingConverged ? (
                       <span className="flex items-center gap-1 text-[11px] font-medium text-amber-400 shrink-0">
                         <AlertTriangle className="w-3.5 h-3.5" />
-                        <span>Prześwit</span>
+                        <span>Sprawdź</span>
                       </span>
                     ) : (
-                      <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400 shrink-0">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>OK</span>
+                      <span className="flex items-center gap-1 text-[11px] font-medium text-slate-400 shrink-0">
+                        <AlertTriangle className="w-3.5 h-3.5" />
+                        <span>Niezweryfikowane*</span>
                       </span>
                     )}
                   </div>
