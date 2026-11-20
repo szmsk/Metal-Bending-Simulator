@@ -1,4 +1,26 @@
-# FalconBEND v3.7: uruchamianie na Windows bez terminala
+# FalconBEND v3.9: naprawa błędu „brak package.json”
+
+**Naprawiono uruchamianie samego pliku EXE.** FalconBEND.exe zawiera teraz źródła aplikacji,
+więc nie wymaga, aby `package.json`, `src/` i `public/` znajdowały się obok niego.
+Możesz skopiować EXE na pulpit lub do dowolnego katalogu. Przy pierwszym starcie
+sam rozpakowuje zasoby do `%LOCALAPPDATA%\FalconBEND\versions\<wersja>`.
+
+- **Pierwszy start na komputerze** wymaga Node.js (z npm) i internetu: program automatycznie
+  instaluje zależności i buduje statyczną aplikację w swoim folderze użytkownika.
+- **Następne starty** otwierają gotową wersję offline, bez wpisywania poleceń, nawet gdy
+  przeniesiesz plik EXE do innego folderu. Zapis ustawień w przeglądarce pozostaje.
+- **Jeśli stara wersja uruchomiona jest w tle**, nowy launcher zamknie ją, by
+  nie otwierać starego serwera.
+- **Edycja źródeł:** gdy EXE znajduje się w kompletnym folderze z `package.json`
+  i `src/main.tsx`, uruchamia projekt z tego folderu (tryb deweloperski).
+- **Windows SmartScreen:** EXE nadal jest niepodpisany certyfikatem zaufanego wydawcy.
+  Ta poprawka usuwa błąd braku źródeł, ale NIE usuwa ostrzeżenia SmartScreen.
+- **Weryfikacja:** testy Go obejmują rozpakowanie zasobów, naprawę brakujących plików,
+  uruchomienie po przeniesieniu EXE, symulowany pierwszy build i restart offline.
+  Pełny `npm run build` nie został wykonany w środowisku tworzenia paczki z powodu
+  niedostępnego rejestru npm.
+
+# FalconBEND v3.7: poprzedni sposób uruchamiania (folder projektu)
 
 **Najprostszy sposób:** rozpakuj całe archiwum ZIP i uruchom `FalconBEND.exe` dwuklikiem. Program otworzy się w domyślnej przeglądarce pod adresem `http://127.0.0.1:45971/`. Nie musisz wpisywać `npm run dev`.
 

@@ -5,317 +5,439 @@ package main
 // is created automatically from the included source using Node/npm.
 
 import (
-    "crypto/sha256"
-    "encoding/hex"
-    "encoding/json"
-    "errors"
-    "fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "os"
-    "os/exec"
-    "path/filepath"
-    "runtime"
-    "sort"
-    "strings"
-    "sync"
-    "time"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 )
 
 const (
-    firstPort   = 45971
-    lastPort    = 45979
-    appMarker   = "FalconBEND-Local-1"
-    manifest    = ".falcon-build-hash.txt"
+	firstPort = 45971
+	lastPort  = 45979
+	appMarker = "FalconBEND-Local-v3.9-e0bca370"
+	manifest  = ".falcon-build-hash.txt"
 )
 
 type appStatus struct {
-    Ready     bool     `json:"ready"`
-    Busy      bool     `json:"busy"`
-    Stage     string   `json:"stage"`
-    Error     string   `json:"error"`
-    Log       []string `json:"log"`
+	Ready bool     `json:"ready"`
+	Busy  bool     `json:"busy"`
+	Stage string   `json:"stage"`
+	Error string   `json:"error"`
+	Log   []string `json:"log"`
 }
 
 type appServer struct {
-    mu       sync.RWMutex
-    state    appStatus
-    baseDir  string
-    distDir  string
-    httpSrv  *http.Server
-    port     int
+	mu      sync.RWMutex
+	state   appStatus
+	baseDir string
+	bundled bool
+	distDir string
+	httpSrv *http.Server
+	port    int
 }
 
 func (a *appServer) snapshot() appStatus {
-    a.mu.RLock()
-    defer a.mu.RUnlock()
-    cp := a.state
-    cp.Log = append([]string(nil), a.state.Log...)
-    return cp
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cp := a.state
+	cp.Log = append([]string(nil), a.state.Log...)
+	return cp
 }
 
 func (a *appServer) note(line string) {
-    line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
-    if line == "" { return }
-    if len(line) > 500 { line = line[:500] + "…" }
-    a.mu.Lock()
-    a.state.Log = append(a.state.Log, line)
-    if len(a.state.Log) > 100 { a.state.Log = a.state.Log[len(a.state.Log)-100:] }
-    a.mu.Unlock()
+	line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
+	if line == "" {
+		return
+	}
+	if len(line) > 500 {
+		line = line[:500] + "…"
+	}
+	a.mu.Lock()
+	a.state.Log = append(a.state.Log, line)
+	if len(a.state.Log) > 100 {
+		a.state.Log = a.state.Log[len(a.state.Log)-100:]
+	}
+	a.mu.Unlock()
 }
 
 func (a *appServer) setStage(stage string) {
-    a.mu.Lock()
-    a.state.Stage = stage
-    a.mu.Unlock()
+	a.mu.Lock()
+	a.state.Stage = stage
+	a.mu.Unlock()
 }
 
 func (a *appServer) startBuild() {
-    a.mu.Lock()
-    if a.state.Busy { a.mu.Unlock(); return }
-    a.state.Busy = true
-    a.state.Ready = false
-    a.state.Error = ""
-    a.state.Stage = "Sprawdzanie konfiguracji…"
-    a.state.Log = nil
-    a.mu.Unlock()
-    go func() {
-        if err := a.build(); err != nil {
-            a.note("Błąd: " + err.Error())
-            a.mu.Lock()
-            a.state.Busy = false
-            a.state.Ready = false
-            a.state.Error = err.Error()
-            a.state.Stage = "Nie udało się przygotować aplikacji"
-            a.mu.Unlock()
-            return
-        }
-        a.mu.Lock()
-        a.state.Busy = false
-        a.state.Ready = true
-        a.state.Stage = "Aplikacja gotowa"
-        a.mu.Unlock()
-    }()
+	a.mu.Lock()
+	if a.state.Busy {
+		a.mu.Unlock()
+		return
+	}
+	a.state.Busy = true
+	a.state.Ready = false
+	a.state.Error = ""
+	a.state.Stage = "Sprawdzanie konfiguracji…"
+	a.state.Log = nil
+	a.mu.Unlock()
+	go func() {
+		if err := a.build(); err != nil {
+			a.note("Błąd: " + err.Error())
+			a.mu.Lock()
+			a.state.Busy = false
+			a.state.Ready = false
+			a.state.Error = err.Error()
+			a.state.Stage = "Nie udało się przygotować aplikacji"
+			a.mu.Unlock()
+			return
+		}
+		a.mu.Lock()
+		a.state.Busy = false
+		a.state.Ready = true
+		a.state.Stage = "Aplikacja gotowa"
+		a.mu.Unlock()
+	}()
 }
 
 func (a *appServer) runNpm(args ...string) error {
-    name := "npm"
-    if runtime.GOOS == "windows" { name = "npm.cmd" }
-    if _, err := exec.LookPath(name); err != nil {
-        return fmt.Errorf("nie znaleziono Node.js/npm. Zainstaluj aktualny Node.js LTS i uruchom FalconBEND ponownie: %w", err)
-    }
-    cmd := exec.Command(name, args...)
-    cmd.Dir = a.baseDir
-    hideChildWindow(cmd)
-    cmd.Env = append(os.Environ(), "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false")
-    w := &lineWriter{writeLine: a.note}
-    cmd.Stdout, cmd.Stderr = w, w
-    a.note("npm " + strings.Join(args, " "))
-    err := cmd.Run()
-    w.flush()
-    if err != nil { return fmt.Errorf("polecenie npm %s zakończyło się błędem: %w", strings.Join(args, " "), err) }
-    return nil
+	name := "npm"
+	if runtime.GOOS == "windows" {
+		name = "npm.cmd"
+	}
+	if _, err := exec.LookPath(name); err != nil {
+		return fmt.Errorf("nie znaleziono Node.js/npm. Zainstaluj Node.js LTS z nodejs.org, uruchom ponownie komputer i kliknij Sprobuj ponownie: %w", err)
+	}
+	cmd := exec.Command(name, args...)
+	cmd.Dir = a.baseDir
+	hideChildWindow(cmd)
+	cmd.Env = append(os.Environ(), "NPM_CONFIG_AUDIT=false", "NPM_CONFIG_FUND=false")
+	w := &lineWriter{writeLine: a.note}
+	cmd.Stdout, cmd.Stderr = w, w
+	a.note("npm " + strings.Join(args, " "))
+	err := cmd.Run()
+	w.flush()
+	if err != nil {
+		return fmt.Errorf("polecenie npm %s zakończyło się błędem: %w", strings.Join(args, " "), err)
+	}
+	return nil
 }
 
 func (a *appServer) build() error {
-    if _, err := os.Stat(filepath.Join(a.baseDir, "package.json")); err != nil {
-        return errors.New("brak package.json: uruchom FalconBEND.exe z rozpakowanego folderu projektu")
-    }
-    a.setStage("Instalowanie zależności (tylko pierwszy raz lub po aktualizacji)…")
-    lockfile := filepath.Join(a.baseDir, "package-lock.json")
-    _, lockErr := os.Stat(lockfile)
-    _, modsErr := os.Stat(filepath.Join(a.baseDir, "node_modules"))
-    if modsErr != nil {
-        if lockErr == nil {
-            if err := a.runNpm("ci", "--no-audit", "--no-fund"); err != nil { return err }
-        } else if err := a.runNpm("install", "--no-audit", "--no-fund"); err != nil { return err }
-    } else {
-        // Source/package update: npm install is idempotent and keeps deps in sync.
-        if err := a.runNpm("install", "--no-audit", "--no-fund"); err != nil { return err }
-    }
-    a.setStage("Budowanie wersji offline…")
-    if err := a.runNpm("run", "build"); err != nil { return err }
-    if _, err := os.Stat(filepath.Join(a.distDir, "index.html")); err != nil { return fmt.Errorf("Vite nie utworzył dist/index.html: %w", err) }
-    digest, err := projectDigest(a.baseDir)
-    if err != nil { return err }
-    if err := os.WriteFile(filepath.Join(a.distDir, manifest), []byte(digest+"\n"), 0644); err != nil { return err }
-    a.note("Zbudowano aplikację. Kolejne uruchomienia nie wymagają npm ani internetu.")
-    return nil
+	if a.bundled {
+		a.setStage("Rozpakowywanie wbudowanej aplikacji do folderu uzytkownika…")
+		if err := ensureBundledProject(a.baseDir); err != nil {
+			return fmt.Errorf("nie udalo sie przygotowac wbudowanej aplikacji: %w", err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(a.baseDir, "package.json")); err != nil {
+		return errors.New("brak package.json po przygotowaniu aplikacji; sprawdz uprawnienia do folderu danych")
+	}
+	a.setStage("Instalowanie zależności (tylko pierwszy raz lub po aktualizacji)…")
+	lockfile := filepath.Join(a.baseDir, "package-lock.json")
+	_, lockErr := os.Stat(lockfile)
+	_, modsErr := os.Stat(filepath.Join(a.baseDir, "node_modules"))
+	if modsErr != nil {
+		if lockErr == nil {
+			if err := a.runNpm("ci", "--no-audit", "--no-fund"); err != nil {
+				return err
+			}
+		} else if err := a.runNpm("install", "--no-audit", "--no-fund"); err != nil {
+			return err
+		}
+	} else {
+		// Source/package update: npm install is idempotent and keeps deps in sync.
+		if err := a.runNpm("install", "--no-audit", "--no-fund"); err != nil {
+			return err
+		}
+	}
+	a.setStage("Budowanie wersji offline…")
+	if err := a.runNpm("run", "build"); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(a.distDir, "index.html")); err != nil {
+		return fmt.Errorf("Vite nie utworzył dist/index.html: %w", err)
+	}
+	digest, err := projectDigest(a.baseDir)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(a.distDir, manifest), []byte(digest+"\n"), 0644); err != nil {
+		return err
+	}
+	a.note("Zbudowano aplikację. Kolejne uruchomienia nie wymagają npm ani internetu.")
+	return nil
 }
 
 type lineWriter struct {
-    mu sync.Mutex
-    pending string
-    writeLine func(string)
+	mu        sync.Mutex
+	pending   string
+	writeLine func(string)
 }
+
 func (w *lineWriter) Write(p []byte) (int, error) {
-    w.mu.Lock()
-    defer w.mu.Unlock()
-    w.pending += string(p)
-    lines := strings.Split(w.pending, "\n")
-    for _, l := range lines[:len(lines)-1] { w.writeLine(l) }
-    w.pending = lines[len(lines)-1]
-    if len(w.pending) > 10000 { w.writeLine(w.pending[:10000]); w.pending = "" }
-    return len(p), nil
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pending += string(p)
+	lines := strings.Split(w.pending, "\n")
+	for _, l := range lines[:len(lines)-1] {
+		w.writeLine(l)
+	}
+	w.pending = lines[len(lines)-1]
+	if len(w.pending) > 10000 {
+		w.writeLine(w.pending[:10000])
+		w.pending = ""
+	}
+	return len(p), nil
 }
 func (w *lineWriter) flush() {
-    w.mu.Lock()
-    defer w.mu.Unlock()
-    if w.pending != "" { w.writeLine(w.pending); w.pending = "" }
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pending != "" {
+		w.writeLine(w.pending)
+		w.pending = ""
+	}
 }
 
 func projectDigest(base string) (string, error) {
-    files := []string{"package.json", "vite.config.ts", "index.html", "tsconfig.json"}
-    if _, err := os.Stat(filepath.Join(base, "package-lock.json")); err == nil {
-        files = append(files, "package-lock.json")
-    }
-    for _, dir := range []string{"src", "public"} {
-        err := filepath.Walk(filepath.Join(base, dir), func(full string, info os.FileInfo, err error) error {
-            if err != nil { return err }
-            if info.IsDir() { return nil }
-            rel, err := filepath.Rel(base, full)
-            if err != nil { return err }
-            files = append(files, rel)
-            return nil
-        })
-        if err != nil { return "", err }
-    }
-    sort.Strings(files)
-    h := sha256.New()
-    h.Write([]byte("FalconBEND-launcher-v1\n"))
-    for _, rel := range files {
-        h.Write([]byte(filepath.ToSlash(rel) + "\x00"))
-        file, err := os.Open(filepath.Join(base, rel))
-        if err != nil { return "", err }
-        _, readErr := io.Copy(h, file)
-        closeErr := file.Close()
-        if readErr != nil { return "", readErr }
-        if closeErr != nil { return "", closeErr }
-    }
-    return hex.EncodeToString(h.Sum(nil)), nil
+	files := []string{"package.json", "vite.config.ts", "index.html", "tsconfig.json"}
+	if _, err := os.Stat(filepath.Join(base, "package-lock.json")); err == nil {
+		files = append(files, "package-lock.json")
+	}
+	for _, dir := range []string{"src", "public"} {
+		err := filepath.Walk(filepath.Join(base, dir), func(full string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(base, full)
+			if err != nil {
+				return err
+			}
+			files = append(files, rel)
+			return nil
+		})
+		if err != nil {
+			return "", err
+		}
+	}
+	sort.Strings(files)
+	h := sha256.New()
+	h.Write([]byte("FalconBEND-launcher-v1\n"))
+	for _, rel := range files {
+		h.Write([]byte(filepath.ToSlash(rel) + "\x00"))
+		file, err := os.Open(filepath.Join(base, rel))
+		if err != nil {
+			return "", err
+		}
+		_, readErr := io.Copy(h, file)
+		closeErr := file.Close()
+		if readErr != nil {
+			return "", readErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (a *appServer) isBuilt() bool {
-    if _, err := os.Stat(filepath.Join(a.distDir, "index.html")); err != nil { return false }
-    saved, err := os.ReadFile(filepath.Join(a.distDir, manifest))
-    if err != nil { return false }
-    digest, err := projectDigest(a.baseDir)
-    return err == nil && strings.TrimSpace(string(saved)) == digest
+	if _, err := os.Stat(filepath.Join(a.distDir, "index.html")); err != nil {
+		return false
+	}
+	saved, err := os.ReadFile(filepath.Join(a.distDir, manifest))
+	if err != nil {
+		return false
+	}
+	digest, err := projectDigest(a.baseDir)
+	return err == nil && strings.TrimSpace(string(saved)) == digest
 }
 
 func isLocalHost(host string, port int) bool {
-    return host == fmt.Sprintf("127.0.0.1:%d", port) || host == fmt.Sprintf("localhost:%d", port)
+	return host == fmt.Sprintf("127.0.0.1:%d", port) || host == fmt.Sprintf("localhost:%d", port)
 }
 func (a *appServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    if !isLocalHost(r.Host, a.port) { http.Error(w, "Dostęp wyłącznie lokalny", http.StatusForbidden); return }
-    w.Header().Set("X-Content-Type-Options", "nosniff")
-    if strings.HasPrefix(r.URL.Path, "/__falcon_") { a.api(w, r); return }
-    status := a.snapshot()
-    if !status.Ready {
-        w.Header().Set("Content-Type", "text/html; charset=utf-8")
-        w.Header().Set("Cache-Control", "no-store")
-        io.WriteString(w, setupPage)
-        return
-    }
-    if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-        w.Header().Set("Cache-Control", "no-store")
-    }
-    fileServer := http.FileServer(http.Dir(a.distDir))
-    localPath := filepath.Join(a.distDir, filepath.FromSlash(strings.TrimPrefix(filepath.Clean(r.URL.Path), string(filepath.Separator))))
-    if info, err := os.Stat(localPath); err != nil || (info.IsDir() && r.URL.Path != "/") {
-        // Browser-based navigation in a client-side SPA.
-        if filepath.Ext(r.URL.Path) == "" {
-            r2 := r.Clone(r.Context())
-            r2.URL.Path = "/"
-            fileServer.ServeHTTP(w, r2)
-            return
-        }
-    }
-    fileServer.ServeHTTP(w, r)
+	if !isLocalHost(r.Host, a.port) {
+		http.Error(w, "Dostęp wyłącznie lokalny", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if strings.HasPrefix(r.URL.Path, "/__falcon_") {
+		a.api(w, r)
+		return
+	}
+	status := a.snapshot()
+	if !status.Ready {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		io.WriteString(w, setupPage)
+		return
+	}
+	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	fileServer := http.FileServer(http.Dir(a.distDir))
+	localPath := filepath.Join(a.distDir, filepath.FromSlash(strings.TrimPrefix(filepath.Clean(r.URL.Path), string(filepath.Separator))))
+	if info, err := os.Stat(localPath); err != nil || (info.IsDir() && r.URL.Path != "/") {
+		// Browser-based navigation in a client-side SPA.
+		if filepath.Ext(r.URL.Path) == "" {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/"
+			fileServer.ServeHTTP(w, r2)
+			return
+		}
+	}
+	fileServer.ServeHTTP(w, r)
 }
 func (a *appServer) api(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Cache-Control", "no-store")
-    switch r.URL.Path {
-    case "/__falcon_health":
-        w.Header().Set("Content-Type", "text/plain")
-        io.WriteString(w, appMarker)
-    case "/__falcon_status":
-        w.Header().Set("Content-Type", "application/json; charset=utf-8")
-        _ = json.NewEncoder(w).Encode(a.snapshot())
-    case "/__falcon_retry":
-        if r.Method != http.MethodPost || r.Header.Get("X-FalconBEND-Action") != "1" { http.Error(w, "Forbidden", 403); return }
-        a.startBuild()
-        w.WriteHeader(http.StatusNoContent)
-    case "/__falcon_stop":
-        if r.Method != http.MethodPost || r.Header.Get("X-FalconBEND-Action") != "1" { http.Error(w, "Forbidden", 403); return }
-        w.WriteHeader(http.StatusNoContent)
-        go func() { time.Sleep(200*time.Millisecond); _ = a.httpSrv.Close() }()
-    default:
-        http.NotFound(w, r)
-    }
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.URL.Path {
+	case "/__falcon_health":
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, appMarker)
+	case "/__falcon_status":
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(a.snapshot())
+	case "/__falcon_retry":
+		if r.Method != http.MethodPost || r.Header.Get("X-FalconBEND-Action") != "1" {
+			http.Error(w, "Forbidden", 403)
+			return
+		}
+		a.startBuild()
+		w.WriteHeader(http.StatusNoContent)
+	case "/__falcon_stop":
+		if r.Method != http.MethodPost || r.Header.Get("X-FalconBEND-Action") != "1" {
+			http.Error(w, "Forbidden", 403)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		go func() { time.Sleep(200 * time.Millisecond); _ = a.httpSrv.Close() }()
+	default:
+		http.NotFound(w, r)
+	}
 }
 
-func aliveAt(port int) bool {
-    client := http.Client{Timeout: 500*time.Millisecond}
-    url := fmt.Sprintf("http://127.0.0.1:%d/__falcon_health", port)
-    resp, err := client.Get(url)
-    if err != nil { return false }
-    defer resp.Body.Close()
-    buf, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
-    return resp.StatusCode == 200 && string(buf) == appMarker
+func markerAt(port int) string {
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	url := fmt.Sprintf("http://127.0.0.1:%d/__falcon_health", port)
+	resp, err := client.Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	buf, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+	return string(buf)
+}
+func aliveAt(port int) bool { return markerAt(port) == appMarker }
+func sendStop(port int) {
+	client := http.Client{Timeout: 700 * time.Millisecond}
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/__falcon_stop", port), nil)
+	req.Header.Set("X-FalconBEND-Action", "1")
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
 }
 func stopInstance() {
-    client := http.Client{Timeout: 650*time.Millisecond}
-    for port := firstPort; port <= lastPort; port++ {
-        if !aliveAt(port) { continue }
-        req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/__falcon_stop", port), nil)
-        req.Header.Set("X-FalconBEND-Action", "1")
-        resp, err := client.Do(req)
-        if err == nil { resp.Body.Close() }
-    }
+	for port := firstPort; port <= lastPort; port++ {
+		if strings.HasPrefix(markerAt(port), "FalconBEND-Local-") {
+			sendStop(port)
+		}
+	}
+}
+func stopOlderInstances() {
+	stopped := false
+	for port := firstPort; port <= lastPort; port++ {
+		marker := markerAt(port)
+		if marker != "" && marker != appMarker && strings.HasPrefix(marker, "FalconBEND-Local-") {
+			sendStop(port)
+			stopped = true
+		}
+	}
+	if stopped {
+		// Permit the previous version to release port 45971, preserving
+		// existing browser localStorage settings on upgrades.
+		for i := 0; i < 20 && markerAt(firstPort) != ""; i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 func exeDirectory() string {
-    path, err := os.Executable()
-    if err != nil { return "." }
-    abs, err := filepath.EvalSymlinks(path)
-    if err == nil { path = abs }
-    return filepath.Dir(path)
+	path, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	abs, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		path = abs
+	}
+	return filepath.Dir(path)
 }
 func main() {
-    if len(os.Args) > 1 && os.Args[1] == "--stop" { stopInstance(); return }
-    base := exeDirectory()
-    for port := firstPort; port <= lastPort; port++ {
-        if aliveAt(port) {
-            _ = openBrowser(fmt.Sprintf("http://127.0.0.1:%d/", port))
-            return
-        }
-    }
-    a := &appServer{baseDir: base, distDir: filepath.Join(base, "dist")}
-    if a.isBuilt() {
-        a.state.Ready = true
-        a.state.Stage = "Aplikacja gotowa"
-    } else {
-        a.state.Stage = "Uruchamianie pierwszej instalacji…"
-    }
-    var listener net.Listener
-    for port := firstPort; port <= lastPort; port++ {
-        l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-        if err == nil { listener, a.port = l, port; break }
-        // Another launch may win the race; re-check the health endpoint.
-        if aliveAt(port) { _ = openBrowser(fmt.Sprintf("http://127.0.0.1:%d/", port)); return }
-    }
-    if listener == nil {
-        log.Print("FalconBEND cannot listen on loopback ports 45971-45979")
-        return
-    }
-    a.httpSrv = &http.Server{Handler: a, ReadHeaderTimeout: 5*time.Second}
-    if !a.state.Ready { a.startBuild() }
-    _ = openBrowser(fmt.Sprintf("http://127.0.0.1:%d/", a.port))
-    if err := a.httpSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) { log.Print(err) }
+	if len(os.Args) > 1 && os.Args[1] == "--stop" {
+		stopInstance()
+		return
+	}
+	base, bundled, err := resolveProjectDirectory(exeDirectory())
+	if err != nil {
+		log.Printf("FalconBEND: nie moge przygotowac folderu danych: %v", err)
+		return
+	}
+	for port := firstPort; port <= lastPort; port++ {
+		if aliveAt(port) {
+			_ = openBrowser(fmt.Sprintf("http://127.0.0.1:%d/", port))
+			return
+		}
+	}
+	a := &appServer{baseDir: base, bundled: bundled, distDir: filepath.Join(base, "dist")}
+	if a.isBuilt() {
+		a.state.Ready = true
+		a.state.Stage = "Aplikacja gotowa"
+	} else {
+		a.state.Stage = "Uruchamianie pierwszej instalacji…"
+	}
+	var listener net.Listener
+	for port := firstPort; port <= lastPort; port++ {
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			listener, a.port = l, port
+			break
+		}
+		// Another launch may win the race; re-check the health endpoint.
+		if aliveAt(port) {
+			_ = openBrowser(fmt.Sprintf("http://127.0.0.1:%d/", port))
+			return
+		}
+	}
+	if listener == nil {
+		log.Print("FalconBEND cannot listen on loopback ports 45971-45979")
+		return
+	}
+	a.httpSrv = &http.Server{Handler: a, ReadHeaderTimeout: 5 * time.Second}
+	if !a.state.Ready {
+		a.startBuild()
+	}
+	_ = openBrowser(fmt.Sprintf("http://127.0.0.1:%d/", a.port))
+	if err := a.httpSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Print(err)
+	}
 }
-
 
 const setupPage = `<!doctype html>
 <html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
